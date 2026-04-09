@@ -3,7 +3,7 @@ name = "yolo11-26-visdrone-openmv-npu"
 version = "0.1.0"
 description = "Train YOLO11/YOLO26 on VisDrone and deploy INT8 TFLite models to OpenMV AE3 and N6 NPUs"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.14"
 authors = [
     { name = "TankMasterRL" },
 ]
