@@ -1,0 +1,32 @@
+# Keep the build context small — the Dockerfile doesn't COPY the
+# project (we bind-mount it at runtime), but a tidy context still
+# speeds up `docker compose build`.
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+
+# Virtualenvs
+.venv/
+venv/
+
+# Training / export artefacts (can be huge)
+runs/
+export/
+*.pt
+*.tflite
+*.onnx
+
+# Git + CI
+.git/
+.github/
+.gitignore
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

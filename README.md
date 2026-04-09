@@ -14,6 +14,9 @@ region-based object counting on both the **OpenMV AE3** and **OpenMV N6**.
 .
 ├── train_and_export.py              # Training + export + NPU compilation
 ├── tune_hyperparameters.py          # Ray Tune hyperparameter search + TensorBoard
+├── docker/
+│   └── Dockerfile                   # GPU image extending ultralytics/ultralytics
+├── docker-compose.yml               # Train / tune / tensorboard / shell services
 ├── openmv-scripts/
 │   ├── region_counter.py            # Shared counting module (upload to all boards)
 │   ├── ae3/                         # Scripts for OpenMV AE3
@@ -111,6 +114,57 @@ from ST and add `stedgeai` to your PATH.
 
 Download from [openmv.io](https://openmv.io/pages/download) for uploading
 scripts and models to the cameras.
+
+### Docker (GPU) — recommended for training & tuning
+
+The repository ships a Docker Compose setup that bundles CUDA, PyTorch,
+Ultralytics, Ray Tune, TensorBoard and Arm Vela in a single GPU image —
+no local Python setup required beyond Docker itself. The image extends
+the official [`ultralytics/ultralytics`](https://hub.docker.com/r/ultralytics/ultralytics)
+base (see the [Ultralytics Docker Quickstart](https://docs.ultralytics.com/guides/docker-quickstart/)).
+
+**Host prerequisites:**
+- NVIDIA GPU + driver
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+- Docker Engine 23+ with Compose v2
+
+**Quickstart:**
+
+```bash
+# Build the GPU image (once)
+docker compose build
+
+# Full training + export pipeline (all 4 models)
+docker compose run --rm train
+
+# Override args — e.g. train only yolo11n for 20 epochs
+docker compose run --rm train python train_and_export.py --models yolo11n --epochs 20
+
+# Ray Tune hyperparameter sweep for all four models
+docker compose run --rm tune
+
+# TensorBoard on http://localhost:6006 (Ctrl-C to stop)
+docker compose up tensorboard
+
+# Interactive GPU shell for ad-hoc yolo/uv commands
+docker compose run --rm shell
+```
+
+**What's in the image** (`docker/Dockerfile`):
+- Base: `ultralytics/ultralytics:latest` (Ubuntu + CUDA + PyTorch + Ultralytics)
+- `ray[tune]` for hyperparameter search
+- `tensorboard` for visualisation
+- `ethos-u-vela` for OpenMV AE3 NPU compilation
+
+**What's mounted** (`docker-compose.yml`):
+- `.` → `/workspace` — live project source
+- Named volume `datasets` → `/datasets` (`YOLO_DATASETS_DIR`) so VisDrone is downloaded only once
+- Named volume `ultralytics-cache` → `/root/.config/Ultralytics`
+- Named volume `pip-cache` → `/root/.cache/pip`
+
+All GPU services run with `ipc: host`, `shm_size: 8gb`, and
+`deploy.resources.reservations.devices: nvidia` so PyTorch DataLoader
+workers and multi-GPU training work correctly.
 
 ---
 

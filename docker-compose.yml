@@ -1,0 +1,115 @@
+# Docker Compose for YOLO11/YOLO26 × VisDrone × OpenMV
+#
+# Provides GPU-accelerated services for training, hyperparameter
+# tuning, and TensorBoard visualisation. Built on top of the official
+# Ultralytics image (see docker/Dockerfile).
+#
+# Prerequisites on the host:
+#   - NVIDIA GPU + driver
+#   - NVIDIA Container Toolkit (enables --gpus all)
+#   - Docker Engine 23+ with Compose v2
+#
+# Quickstart:
+#   docker compose build
+#   docker compose run --rm train            # full training pipeline
+#   docker compose run --rm tune             # Ray Tune sweep (all 4 models)
+#   docker compose up tensorboard            # TensorBoard on :6006
+#   docker compose run --rm shell            # interactive dev shell
+#
+
+# --- Shared service config (YAML anchor) ---------------------------------
+# Every GPU service reuses this block. `ipc: host` and a generous
+# `shm_size` are required for PyTorch DataLoader workers. GPU access is
+# declared via the portable Compose `deploy.resources` syntax which works
+# with NVIDIA Container Toolkit out of the box.
+x-gpu-service: &gpu-service
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  image: yolo11-26-visdrone-openmv:gpu
+  ipc: host
+  shm_size: "8gb"
+  ulimits:
+    memlock: -1
+    stack: 67108864
+  environment:
+    - PYTHONUNBUFFERED=1
+    - YOLO_DATASETS_DIR=/datasets
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+  volumes:
+    # Project source (live-mounted so edits on the host are reflected
+    # inside the container without rebuilding)
+    - .:/workspace
+    # VisDrone and any other Ultralytics-downloaded datasets — persists
+    # between runs so we don't re-download the ~2GB archive each time
+    - datasets:/datasets
+    # Ultralytics config & cache (weights, settings)
+    - ultralytics-cache:/root/.config/Ultralytics
+    # pip / uv wheel cache
+    - pip-cache:/root/.cache/pip
+  working_dir: /workspace
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  # ----------------------------------------------------------------------
+  # Full training + export pipeline (all 4 YOLO models → TFLite INT8 +
+  # optional NPU compilation). Override the command to customise, e.g.:
+  #   docker compose run --rm train python train_and_export.py --models yolo11n
+  # ----------------------------------------------------------------------
+  train:
+    <<: *gpu-service
+    container_name: yolo-visdrone-train
+    command: ["python", "train_and_export.py"]
+
+  # ----------------------------------------------------------------------
+  # Ray Tune hyperparameter sweep for all four models (default). Pass
+  # extra CLI args after the service name, e.g.:
+  #   docker compose run --rm tune python tune_hyperparameters.py \
+  #       --models yolo11s --iterations 30 --gpu-per-trial 1
+  # ----------------------------------------------------------------------
+  tune:
+    <<: *gpu-service
+    container_name: yolo-visdrone-tune
+    command: ["python", "tune_hyperparameters.py"]
+
+  # ----------------------------------------------------------------------
+  # TensorBoard server — visualises every training run and Ray Tune
+  # trial. Browse to http://localhost:6006 once the container is up.
+  # ----------------------------------------------------------------------
+  tensorboard:
+    <<: *gpu-service
+    container_name: yolo-visdrone-tensorboard
+    command:
+      - tensorboard
+      - --logdir
+      - runs
+      - --host
+      - 0.0.0.0
+      - --port
+      - "6006"
+    ports:
+      - "6006:6006"
+
+  # ----------------------------------------------------------------------
+  # Interactive development shell with GPU + all project deps available.
+  # Useful for ad-hoc YOLO CLI calls, debugging, or running `uv` commands
+  # against the mounted workspace.
+  # ----------------------------------------------------------------------
+  shell:
+    <<: *gpu-service
+    container_name: yolo-visdrone-shell
+    command: ["/bin/bash"]
+    stdin_open: true
+    tty: true
+
+volumes:
+  datasets:
+  ultralytics-cache:
+  pip-cache:
