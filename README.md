@@ -197,35 +197,37 @@ uv sync --extra tune      # pulls in ray[tune] and tensorboard
 ### Run a tuning sweep
 
 ```bash
-# Default: yolo11n, 10 trials, 30 epochs each, VisDrone-tuned space
+# Default: runs an independent sweep for ALL FOUR models
+# (yolo11n, yolo11s, yolo26n, yolo26s), 10 trials × 30 epochs each
 uv run python tune_hyperparameters.py
 
-# Larger sweep with 1 GPU per trial
+# Subset of models with more trials and 1 GPU per trial
 uv run python tune_hyperparameters.py \
-    --model yolo11s.pt \
+    --models yolo11s yolo26s \
     --iterations 30 \
     --epochs 50 \
     --gpu-per-trial 1
 
-# Use Ultralytics' full default 28-parameter search space
-uv run python tune_hyperparameters.py --default-space
+# Single model, using Ultralytics' full default 28-parameter search space
+uv run python tune_hyperparameters.py --models yolo11n --default-space
 ```
 
 Key flags (see `--help` for the full list):
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model` | `yolo11n.pt` | Pretrained weights to start each trial from |
-| `--iterations` | `10` | Number of hyperparameter samples |
+| `--models` | all four | Subset of `yolo11n yolo11s yolo26n yolo26s` to tune |
+| `--iterations` | `10` | Number of hyperparameter samples **per model** |
 | `--epochs` | `30` | Max epochs per trial (ASHA prunes bad trials early) |
 | `--grace-period` | `10` | ASHA grace period before pruning is allowed |
 | `--gpu-per-trial` | auto | Fractional GPUs per trial (e.g. `0.5` → 2 trials/GPU) |
 | `--default-space` | off | Swap in Ultralytics' full 28-parameter default space |
 
-Internally the script calls `model.tune(use_ray=True, ...)`. Ray Tune
-orchestrates an **ASHA scheduler** (`grace_period`, `reduction_factor=3`),
-and the best trial's hyperparameters are written to
-`runs/tune/visdrone_raytune_best_hyperparameters.json`.
+Internally the script calls `model.tune(use_ray=True, ...)` once per
+selected model. Ray Tune orchestrates an **ASHA scheduler**
+(`grace_period`, `reduction_factor=3`), and each model's best trial is
+written to `runs/tune/visdrone_raytune_<model>_best_hyperparameters.json`.
+A summary table of per-model mAP is printed at the end.
 
 ### Visualise with TensorBoard
 
@@ -234,13 +236,14 @@ TensorBoard against the tuning run directory:
 
 ```bash
 uv run tensorboard --logdir runs/tune
-# or, to see Ray Tune's own metrics:
-uv run tensorboard --logdir ~/ray_results/visdrone_raytune
+# or, to see Ray Tune's own metrics for all models:
+uv run tensorboard --logdir ~/ray_results
 ```
 
-Then open <http://localhost:6006>. Each trial appears as its own run so
-you can overlay `metrics/mAP50-95(B)`, `metrics/mAP50(B)`, training
-losses, and learning-rate curves across the sweep.
+Then open <http://localhost:6006>. Every trial of every model appears
+as its own run (grouped by the `visdrone_raytune_<model>` experiment
+name), so you can overlay `metrics/mAP50-95(B)`, `metrics/mAP50(B)`,
+training losses, and learning-rate curves across the whole sweep.
 
 ### Re-train with the best hyperparameters
 

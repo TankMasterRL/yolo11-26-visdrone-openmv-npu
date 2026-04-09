@@ -7,28 +7,36 @@ Wraps Ultralytics' built-in ``model.tune(use_ray=True)`` integration
 (see https://docs.ultralytics.com/integrations/ray-tune/) with a
 VisDrone-focused search space tuned for small-object drone imagery.
 
+By default, runs an independent tuning sweep for **all four models**
+(YOLO11n, YOLO11s, YOLO26n, YOLO26s) — each gets its own Ray Tune
+experiment directory and best-hyperparameters JSON.
+
 Ray Tune uses the ASHA scheduler by default – trials that underperform
 are stopped early, so ``--iterations`` can be set relatively high.
 
 TensorBoard integration:
     Ultralytics writes per-trial TFEvent logs into each trial's
-    training directory (``runs/detect/tune*/train/``). Ray Tune mirrors
-    these under its storage path. Launch TensorBoard on either:
+    training directory (``runs/tune/<name>/.../``). Launch TensorBoard
+    against the root output directory to compare every trial of every
+    model in one UI:
 
-        tensorboard --logdir runs/detect
-        tensorboard --logdir <ray_storage_path>/<exp_name>
+        tensorboard --logdir runs/tune
+
+    Or point at Ray Tune's own storage (default ``~/ray_results``):
+
+        tensorboard --logdir ~/ray_results
 
     The script prints the exact commands at the end of the run.
 
 Usage:
-    # Default: yolo11n, 10 trials, 30 epochs each, grace period 10
+    # Default: tune all 4 models, 10 trials each, 30 epochs, grace 10
     uv run python tune_hyperparameters.py
 
-    # Small model, more trials, single GPU per trial
+    # Subset of models, more trials, 1 GPU per trial
     uv run python tune_hyperparameters.py \\
-        --model yolo11s --iterations 30 --gpu-per-trial 1
+        --models yolo11s yolo26s --iterations 30 --gpu-per-trial 1
 
-    # Re-use a custom dataset
+    # Use a different dataset
     uv run python tune_hyperparameters.py --data VisDrone.yaml --epochs 50
 """
 
@@ -37,7 +45,18 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from pathlib import Path
+
+# Models to tune: (friendly name → Ultralytics weights id).
+# Matches ALL_MODELS in train_and_export.py so downstream workflows
+# share a consistent set of model keys.
+ALL_MODELS = {
+    "yolo11n": "yolo11n.pt",
+    "yolo11s": "yolo11s.pt",
+    "yolo26n": "yolo26n.pt",
+    "yolo26s": "yolo26s.pt",
+}
 
 
 def build_search_space():
@@ -84,8 +103,9 @@ def parse_args() -> argparse.Namespace:
         description="Ray Tune hyperparameter search for YOLO on VisDrone"
     )
     p.add_argument(
-        "--model", default="yolo11n.pt",
-        help="Pretrained YOLO weights to start from (default: yolo11n.pt)",
+        "--models", nargs="+", default=list(ALL_MODELS.keys()),
+        choices=list(ALL_MODELS.keys()),
+        help="Which models to tune (default: all four)",
     )
     p.add_argument(
         "--data", default="VisDrone.yaml",
@@ -97,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--iterations", type=int, default=10,
-        help="Number of Ray Tune trials to sample (default: 10)",
+        help="Number of Ray Tune trials to sample per model (default: 10)",
     )
     p.add_argument(
         "--grace-period", type=int, default=10,
@@ -115,11 +135,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--output", default="runs/tune",
-        help="Directory for tuning results (default: runs/tune)",
+        help="Root directory for tuning results (default: runs/tune)",
     )
     p.add_argument(
-        "--name", default="visdrone_raytune",
-        help="Experiment name used by Ray Tune (default: visdrone_raytune)",
+        "--name-prefix", default="visdrone_raytune",
+        help="Experiment name prefix; each model gets '<prefix>_<model>' "
+             "(default: visdrone_raytune)",
     )
     p.add_argument(
         "--default-space", action="store_true",
@@ -127,6 +148,89 @@ def parse_args() -> argparse.Namespace:
              "instead of the VisDrone-tuned one",
     )
     return p.parse_args()
+
+
+def tune_one_model(
+    model_key: str,
+    weights: str,
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> dict | None:
+    """
+    Run a Ray Tune sweep for a single model.
+
+    Returns a summary dict (model, name, best metrics + cfg path) on
+    success, or None if the sweep failed.
+    """
+    from ultralytics import YOLO
+
+    exp_name = f"{args.name_prefix}_{model_key}"
+
+    print("\n" + "=" * 72)
+    print(f" [{model_key}]  Ray Tune sweep → {exp_name}")
+    print("=" * 72)
+    print(f"  Weights      : {weights}")
+    print(f"  Iterations   : {args.iterations}")
+    print(f"  Epochs/trial : {args.epochs} (grace={args.grace_period})")
+    print(f"  Image size   : {args.imgsz}")
+    print(f"  GPU/trial    : {args.gpu_per_trial if args.gpu_per_trial else 'auto'}")
+
+    model = YOLO(weights)
+
+    tune_kwargs = dict(
+        data=args.data,
+        epochs=args.epochs,
+        imgsz=args.imgsz,
+        iterations=args.iterations,
+        grace_period=args.grace_period,
+        use_ray=True,
+        project=str(output_dir),
+        name=exp_name,
+    )
+    if args.gpu_per_trial is not None:
+        tune_kwargs["gpu_per_trial"] = args.gpu_per_trial
+    if not args.default_space:
+        tune_kwargs["space"] = build_search_space()
+
+    try:
+        result_grid = model.tune(**tune_kwargs)
+    except Exception as e:
+        print(f"  ✗ Tuning failed for {model_key}: {e}")
+        traceback.print_exc()
+        return None
+
+    # --- Extract & persist best trial -----------------------------------
+    summary = {"model": model_key, "name": exp_name, "weights": weights}
+    try:
+        best_result = result_grid.get_best_result(
+            metric="metrics/mAP50-95(B)", mode="max"
+        )
+        best_cfg = best_result.config
+        best_metrics = best_result.metrics or {}
+
+        print(f"\n  Best trial config for {model_key}:")
+        for k, v in sorted(best_cfg.items()):
+            print(f"    {k:20s} = {v}")
+
+        map5095 = best_metrics.get("metrics/mAP50-95(B)")
+        map50 = best_metrics.get("metrics/mAP50(B)")
+        if map5095 is not None:
+            print(f"\n  mAP50-95 : {map5095:.4f}")
+        if map50 is not None:
+            print(f"  mAP50    : {map50:.4f}")
+
+        best_cfg_path = output_dir / f"{exp_name}_best_hyperparameters.json"
+        best_cfg_path.write_text(json.dumps(best_cfg, indent=2, default=str))
+        print(f"\n  Best hyperparameters saved to: {best_cfg_path}")
+
+        summary["best_cfg_path"] = str(best_cfg_path)
+        summary["mAP50-95"] = map5095
+        summary["mAP50"] = map50
+    except Exception as e:
+        print(f"  Could not extract best trial for {model_key}: {e}")
+        print("  Inspect the ResultGrid manually via the saved Ray experiment.")
+
+    return summary
 
 
 def main() -> None:
@@ -149,81 +253,52 @@ def main() -> None:
         )
         sys.exit(1)
 
-    from ultralytics import YOLO
-
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 72)
     print(" Ray Tune × Ultralytics YOLO × VisDrone")
     print("=" * 72)
-    print(f"  Model        : {args.model}")
+    print(f"  Models       : {', '.join(args.models)}")
     print(f"  Data         : {args.data}")
-    print(f"  Iterations   : {args.iterations}")
+    print(f"  Iterations   : {args.iterations}  (per model)")
     print(f"  Epochs/trial : {args.epochs} (grace={args.grace_period})")
     print(f"  Image size   : {args.imgsz}")
     print(f"  GPU/trial    : {args.gpu_per_trial if args.gpu_per_trial else 'auto'}")
     print(f"  Output       : {output_dir}")
     print(f"  Search space : {'default (28 params)' if args.default_space else 'VisDrone-tuned'}")
-    print("=" * 72, "\n")
+    print("=" * 72)
 
     # ------------------------------------------------------------------
-    # Build the YOLO model and kick off Ray Tune search.
-    # Ultralytics' built-in integration handles:
-    #   - ASHAScheduler (grace_period, reduction_factor=3)
-    #   - Per-trial TensorBoard logging via its default TB callback
-    #   - Result aggregation into a ray.tune.ResultGrid
+    # Run one Ray Tune sweep per model.
+    # Each sweep is independent – a failure in one does not abort the
+    # rest; results are collected into a summary printed at the end.
     # ------------------------------------------------------------------
-    model = YOLO(args.model)
-
-    tune_kwargs = dict(
-        data=args.data,
-        epochs=args.epochs,
-        imgsz=args.imgsz,
-        iterations=args.iterations,
-        grace_period=args.grace_period,
-        use_ray=True,
-        project=str(output_dir),
-        name=args.name,
-    )
-    if args.gpu_per_trial is not None:
-        tune_kwargs["gpu_per_trial"] = args.gpu_per_trial
-    if not args.default_space:
-        tune_kwargs["space"] = build_search_space()
-
-    result_grid = model.tune(**tune_kwargs)
+    summaries: list[dict] = []
+    for model_key in args.models:
+        weights = ALL_MODELS[model_key]
+        summary = tune_one_model(model_key, weights, args, output_dir)
+        if summary is not None:
+            summaries.append(summary)
 
     # ------------------------------------------------------------------
-    # Report best trial and persist hyperparameters
+    # Final summary table
     # ------------------------------------------------------------------
     print("\n" + "=" * 72)
     print(" TUNING COMPLETE")
     print("=" * 72)
-
-    try:
-        best_result = result_grid.get_best_result(
-            metric="metrics/mAP50-95(B)", mode="max"
-        )
-        best_cfg = best_result.config
-        best_metrics = best_result.metrics or {}
-
-        print("\n  Best trial config:")
-        for k, v in sorted(best_cfg.items()):
-            print(f"    {k:20s} = {v}")
-
-        map5095 = best_metrics.get("metrics/mAP50-95(B)")
-        map50 = best_metrics.get("metrics/mAP50(B)")
-        if map5095 is not None:
-            print(f"\n  mAP50-95 : {map5095:.4f}")
-        if map50 is not None:
-            print(f"  mAP50    : {map50:.4f}")
-
-        best_cfg_path = output_dir / f"{args.name}_best_hyperparameters.json"
-        best_cfg_path.write_text(json.dumps(best_cfg, indent=2, default=str))
-        print(f"\n  Best hyperparameters saved to: {best_cfg_path}")
-    except Exception as e:
-        print(f"  Could not extract best trial automatically: {e}")
-        print("  Inspect the ResultGrid manually via the saved Ray experiment.")
+    if summaries:
+        print(f"\n  {'Model':<10} {'mAP50-95':>10} {'mAP50':>10}  Best hyperparameters")
+        print("  " + "-" * 68)
+        for s in summaries:
+            map5095 = s.get("mAP50-95")
+            map50 = s.get("mAP50")
+            map5095_str = f"{map5095:.4f}" if map5095 is not None else "   -  "
+            map50_str = f"{map50:.4f}" if map50 is not None else "   -  "
+            cfg_path = s.get("best_cfg_path", "(unavailable)")
+            print(f"  {s['model']:<10} {map5095_str:>10} {map50_str:>10}  {cfg_path}")
+    else:
+        print("\n  No successful tuning runs – see errors above.")
 
     # ------------------------------------------------------------------
     # TensorBoard instructions
@@ -231,13 +306,15 @@ def main() -> None:
     print("\n" + "-" * 72)
     print(" TensorBoard")
     print("-" * 72)
-    print("  Ultralytics writes TFEvent logs for every trial. Launch with:")
+    print("  Ultralytics writes TFEvent logs for every trial of every model.")
+    print("  Compare all sweeps in one UI with:")
     print(f"    uv run tensorboard --logdir {output_dir}")
-    print("  Or point TensorBoard at Ray Tune's storage path (default ~/ray_results):")
-    print(f"    uv run tensorboard --logdir ~/ray_results/{args.name}")
+    print("  Or view Ray Tune's own metrics (default ~/ray_results):")
+    print("    uv run tensorboard --logdir ~/ray_results")
     print(
-        "\n  Next step – re-train with the best hyperparameters by passing\n"
-        f"  {args.name}_best_hyperparameters.json values into train_and_export.py\n"
+        "\n  Next step – re-train each model with its best hyperparameters\n"
+        "  by passing the *_best_hyperparameters.json values into\n"
+        "  train_and_export.py.\n"
     )
 
 
