@@ -1,0 +1,27 @@
+[project]
+name = "yolo11-26-visdrone-openmv-npu"
+version = "0.1.0"
+description = "Train YOLO11/YOLO26 on VisDrone and deploy INT8 TFLite models to OpenMV AE3 and N6 NPUs"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "TankMasterRL" },
+]
+dependencies = [
+    "ultralytics>=8.3.0",
+]
+
+[project.optional-dependencies]
+# Arm Vela compiler for OpenMV AE3 (Ethos-U55 NPU)
+ae3 = [
+    "ethos-u-vela>=3.12.0",
+]
+# Convenience group for everything installable via pip
+all = [
+    "ultralytics>=8.3.0",
+    "ethos-u-vela>=3.12.0",
+]
+
+[tool.uv]
+# This project is a script collection, not an installable package
+package = false

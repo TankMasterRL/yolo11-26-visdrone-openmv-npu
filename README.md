@@ -79,16 +79,29 @@ Ultralytics auto-downloads and converts the dataset on first use.
 
 ### Training Host (PC / Server)
 
+This project uses [uv](https://docs.astral.sh/uv/) for Python environment
+management. Install uv first:
+
 ```bash
-# Python 3.9+
-pip install ultralytics>=8.3
-
-# For OpenMV AE3 NPU compilation (Ethos-U55)
-pip install ethos-u-vela
-
-# For OpenMV N6 NPU compilation (optional — firmware auto-accelerates)
-# Install STM32Cube.AI (X-CUBE-AI) from ST, add stedgeai to PATH
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+Then sync the project environment (creates `.venv/` and installs deps):
+
+```bash
+# Core training + export dependencies
+uv sync
+
+# Include Arm Vela for OpenMV AE3 NPU compilation
+uv sync --extra ae3
+```
+
+All subsequent commands should be prefixed with `uv run` to use the
+managed environment, e.g. `uv run python train_and_export.py ...`.
+
+For OpenMV N6 NPU compilation (optional — firmware auto-accelerates),
+install [STM32Cube.AI (X-CUBE-AI)](https://www.st.com/en/embedded-software/x-cube-ai.html)
+from ST and add `stedgeai` to your PATH.
 
 ### OpenMV IDE
 
@@ -102,29 +115,29 @@ scripts and models to the cameras.
 ### Full pipeline (all 4 models)
 
 ```bash
-python train_and_export.py --epochs 100 --imgsz 640
+uv run python train_and_export.py --epochs 100 --imgsz 640
 ```
 
 ### Single model
 
 ```bash
-python train_and_export.py --models yolo26n --epochs 50
+uv run python train_and_export.py --models yolo26n --epochs 50
 ```
 
 ### Export only (skip training, re-use existing weights)
 
 ```bash
-python train_and_export.py --skip-train
+uv run python train_and_export.py --skip-train
 ```
 
 ### Custom export resolution
 
 ```bash
 # Smaller input → faster inference, less memory, lower accuracy
-python train_and_export.py --imgsz-export 192
+uv run python train_and_export.py --imgsz-export 192
 
 # Larger input → slower but more accurate
-python train_and_export.py --imgsz-export 320
+uv run python train_and_export.py --imgsz-export 320
 ```
 
 ### What happens

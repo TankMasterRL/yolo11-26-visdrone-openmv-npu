@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+
+# uv / virtualenv
+.venv/
+venv/
+
+# Training + export outputs
+runs/
+export/
+*.pt
+*.tflite
+*.onnx
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
