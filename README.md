@@ -160,12 +160,18 @@ docker compose run --rm shell
 
 **What's in the image** (`docker/Dockerfile`):
 - Base: `ultralytics/ultralytics:latest` (Ubuntu + CUDA + PyTorch + Ultralytics)
-- `ray[tune]` + `tensorboard` for hyperparameter search & visualisation
-- Full TFLite INT8 export chain: `tensorflow`, `tf_keras`, `onnx`,
-  `onnx2tf`, `onnxslim`, `onnxruntime`, `sng4onnx`, `onnx_graphsurgeon`,
-  `ai-edge-litert`, `protobuf` (versions pinned per the
-  [Ultralytics TFLite integration guide](https://docs.ultralytics.com/integrations/tflite/))
-- `ethos-u-vela` for OpenMV AE3 (Ethos-U55) NPU compilation
+- [`uv`](https://docs.astral.sh/uv/) — the same fast Python package manager
+  the host workflow uses — installed from the official distroless image
+- All `[project.optional-dependencies].all` extras from `pyproject.toml`,
+  resolved and installed into the base image's system Python via
+  `uv pip install --system -r pyproject.toml --extra all`. This keeps
+  the Docker image and host `uv sync --extra all` workflow in lock-step:
+  - `ray[tune]` + `tensorboard` for hyperparameter search & visualisation
+  - Full TFLite INT8 export chain: `tensorflow`, `tf_keras`, `onnx`,
+    `onnx2tf`, `onnxslim`, `onnxruntime`, `sng4onnx`, `onnx_graphsurgeon`,
+    `ai-edge-litert`, `protobuf` (versions pinned per the
+    [Ultralytics TFLite integration guide](https://docs.ultralytics.com/integrations/tflite/))
+  - `ethos-u-vela` for OpenMV AE3 (Ethos-U55) NPU compilation
 
 **Enabling OpenMV N6 (Neural-ART) compilation:**
 
