@@ -143,6 +143,14 @@ docker compose run --rm train python train_and_export.py --models yolo11n --epoc
 # Ray Tune hyperparameter sweep for all four models
 docker compose run --rm tune
 
+# Export-only: re-use existing best.pt files, produce INT8 TFLite
+# + Vela-compiled AE3 models for all four variants
+docker compose run --rm export
+
+# Export a single model at a reduced input size
+docker compose run --rm export python train_and_export.py \
+    --skip-train --models yolo11n --imgsz-export 192
+
 # TensorBoard on http://localhost:6006 (Ctrl-C to stop)
 docker compose up tensorboard
 
@@ -152,9 +160,33 @@ docker compose run --rm shell
 
 **What's in the image** (`docker/Dockerfile`):
 - Base: `ultralytics/ultralytics:latest` (Ubuntu + CUDA + PyTorch + Ultralytics)
-- `ray[tune]` for hyperparameter search
-- `tensorboard` for visualisation
-- `ethos-u-vela` for OpenMV AE3 NPU compilation
+- `ray[tune]` + `tensorboard` for hyperparameter search & visualisation
+- Full TFLite INT8 export chain: `tensorflow`, `tf_keras`, `onnx`,
+  `onnx2tf`, `onnxslim`, `onnxruntime`, `sng4onnx`, `onnx_graphsurgeon`,
+  `ai-edge-litert`, `protobuf` (versions pinned per the
+  [Ultralytics TFLite integration guide](https://docs.ultralytics.com/integrations/tflite/))
+- `ethos-u-vela` for OpenMV AE3 (Ethos-U55) NPU compilation
+
+**Enabling OpenMV N6 (Neural-ART) compilation:**
+
+STM32Cube.AI / STEdgeAI-Core is proprietary and not redistributable, so
+it is not baked into the image. Download the Linux installer from
+[STEDGEAI-CUBEAI on st.com](https://www.st.com/en/development-tools/stedgeai-cubeai.html),
+extract it on the host, and bind-mount it at `/opt/stedgeai` when
+running the export service:
+
+```bash
+docker compose run --rm \
+    -v /host/path/to/stedgeai:/opt/stedgeai:ro \
+    export
+```
+
+The image already has `/opt/stedgeai/bin` and
+`/opt/stedgeai/Utilities/{linux,windows}` on its `PATH`, so
+`train_and_export.py` picks up `stedgeai` automatically and emits the
+Neural-ART `.raw` binary under `export/n6/<model>/st_ai_output/`. If
+the mount is absent, the script prints a warning and still produces
+the plain INT8 TFLite that the N6 firmware can load directly.
 
 **What's mounted** (`docker-compose.yml`):
 - `.` → `/workspace` — live project source

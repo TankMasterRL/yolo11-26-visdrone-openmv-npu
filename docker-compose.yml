@@ -13,8 +13,14 @@
 #   docker compose build
 #   docker compose run --rm train            # full training pipeline
 #   docker compose run --rm tune             # Ray Tune sweep (all 4 models)
+#   docker compose run --rm export           # export + NPU compile (no train)
 #   docker compose up tensorboard            # TensorBoard on :6006
 #   docker compose run --rm shell            # interactive dev shell
+#
+# Optional: enable OpenMV N6 NPU compilation by mounting a local
+# STM32Cube.AI / STEdgeAI-Core install at /opt/stedgeai, e.g.
+#   docker compose run --rm \
+#       -v /host/path/to/stedgeai:/opt/stedgeai:ro export
 #
 
 # --- Shared service config (YAML anchor) ---------------------------------
@@ -78,6 +84,32 @@ services:
     <<: *gpu-service
     container_name: yolo-visdrone-tune
     command: ["python", "tune_hyperparameters.py"]
+
+  # ----------------------------------------------------------------------
+  # Export-only service — skips training and runs the TFLite INT8 export
+  # + NPU compilation stages of train_and_export.py for all four models
+  # using whatever best.pt files already exist under runs/visdrone/.
+  #
+  # Requires that `train` (or an equivalent run) has produced weights
+  # at runs/visdrone/<model>/weights/best.pt. The image ships:
+  #   - Ultralytics' full TFLite INT8 export chain (onnx, onnx2tf,
+  #     tensorflow, onnxslim, onnxruntime, ai-edge-litert, ...)
+  #   - Arm Vela for OpenMV AE3 (Ethos-U55) compilation
+  #
+  # To additionally emit Neural-ART binaries for OpenMV N6, bind-mount
+  # a host STM32Cube.AI / STEdgeAI-Core install at /opt/stedgeai:
+  #   docker compose run --rm \
+  #       -v /host/path/to/stedgeai:/opt/stedgeai:ro export
+  #
+  # Override CLI args freely, e.g. to export a single model at a
+  # different input size:
+  #   docker compose run --rm export python train_and_export.py \
+  #       --skip-train --models yolo11n --imgsz-export 192
+  # ----------------------------------------------------------------------
+  export:
+    <<: *gpu-service
+    container_name: yolo-visdrone-export
+    command: ["python", "train_and_export.py", "--skip-train"]
 
   # ----------------------------------------------------------------------
   # TensorBoard server — visualises every training run and Ray Tune
