@@ -16,10 +16,17 @@ dependencies = [
 ae3 = [
     "ethos-u-vela>=3.12.0",
 ]
+# Hyperparameter tuning with Ray Tune + TensorBoard visualisation
+tune = [
+    "ray[tune]>=2.10.0",
+    "tensorboard>=2.15.0",
+]
 # Convenience group for everything installable via pip
 all = [
     "ultralytics>=8.3.0",
     "ethos-u-vela>=3.12.0",
+    "ray[tune]>=2.10.0",
+    "tensorboard>=2.15.0",
 ]
 
 [tool.uv]

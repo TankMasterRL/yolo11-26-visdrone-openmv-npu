@@ -13,6 +13,7 @@ region-based object counting on both the **OpenMV AE3** and **OpenMV N6**.
 ```
 .
 ├── train_and_export.py              # Training + export + NPU compilation
+├── tune_hyperparameters.py          # Ray Tune hyperparameter search + TensorBoard
 ├── openmv-scripts/
 │   ├── region_counter.py            # Shared counting module (upload to all boards)
 │   ├── ae3/                         # Scripts for OpenMV AE3
@@ -94,6 +95,9 @@ uv sync
 
 # Include Arm Vela for OpenMV AE3 NPU compilation
 uv sync --extra ae3
+
+# Include Ray Tune + TensorBoard for hyperparameter search
+uv sync --extra tune
 ```
 
 All subsequent commands should be prefixed with `uv run` to use the
@@ -174,6 +178,76 @@ export/
     │   └── yolo11n_int8.tflite    # direct-load fallback
     └── ...
 ```
+
+---
+
+## 2b. Hyperparameter Tuning (Ray Tune + TensorBoard)
+
+This project includes `tune_hyperparameters.py`, a wrapper around
+Ultralytics' built-in
+[Ray Tune integration](https://docs.ultralytics.com/integrations/ray-tune/)
+with a VisDrone-specific search space tuned for small-object drone imagery.
+
+### Install tuning dependencies
+
+```bash
+uv sync --extra tune      # pulls in ray[tune] and tensorboard
+```
+
+### Run a tuning sweep
+
+```bash
+# Default: yolo11n, 10 trials, 30 epochs each, VisDrone-tuned space
+uv run python tune_hyperparameters.py
+
+# Larger sweep with 1 GPU per trial
+uv run python tune_hyperparameters.py \
+    --model yolo11s.pt \
+    --iterations 30 \
+    --epochs 50 \
+    --gpu-per-trial 1
+
+# Use Ultralytics' full default 28-parameter search space
+uv run python tune_hyperparameters.py --default-space
+```
+
+Key flags (see `--help` for the full list):
+
+| Flag | Default | Description |
+|---|---|---|
+| `--model` | `yolo11n.pt` | Pretrained weights to start each trial from |
+| `--iterations` | `10` | Number of hyperparameter samples |
+| `--epochs` | `30` | Max epochs per trial (ASHA prunes bad trials early) |
+| `--grace-period` | `10` | ASHA grace period before pruning is allowed |
+| `--gpu-per-trial` | auto | Fractional GPUs per trial (e.g. `0.5` → 2 trials/GPU) |
+| `--default-space` | off | Swap in Ultralytics' full 28-parameter default space |
+
+Internally the script calls `model.tune(use_ray=True, ...)`. Ray Tune
+orchestrates an **ASHA scheduler** (`grace_period`, `reduction_factor=3`),
+and the best trial's hyperparameters are written to
+`runs/tune/visdrone_raytune_best_hyperparameters.json`.
+
+### Visualise with TensorBoard
+
+Ultralytics writes TFEvent logs for each trial automatically. Launch
+TensorBoard against the tuning run directory:
+
+```bash
+uv run tensorboard --logdir runs/tune
+# or, to see Ray Tune's own metrics:
+uv run tensorboard --logdir ~/ray_results/visdrone_raytune
+```
+
+Then open <http://localhost:6006>. Each trial appears as its own run so
+you can overlay `metrics/mAP50-95(B)`, `metrics/mAP50(B)`, training
+losses, and learning-rate curves across the sweep.
+
+### Re-train with the best hyperparameters
+
+Copy the values from `*_best_hyperparameters.json` into the
+`DEFAULT_TRAIN_ARGS` of `train_and_export.py` (or pass them as CLI
+overrides via Ultralytics' YAML config) and run the full export
+pipeline to produce your final deployable INT8 TFLite.
 
 ---
 
