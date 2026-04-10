@@ -63,9 +63,32 @@ def build_search_space():
     """
     VisDrone-focused hyperparameter search space.
 
-    The default Ultralytics space covers 28 parameters; we narrow it to
-    the ones that matter most for small-object drone detection and
-    tighten some ranges based on common VisDrone training practice.
+    Derived from Ultralytics' default ``run_ray_tune`` space in
+    ``ultralytics/utils/tuner.py`` and audited against the community
+    recommendations on the Ultralytics forum for VisDrone / small-object
+    drone imagery. Notable VisDrone-specific decisions:
+
+      * ``flipud`` is included (Ultralytics default keeps it) — aerial
+        imagery has no natural "up" and enabling vertical flip roughly
+        doubles the effective dataset with zero label cost.
+      * ``fliplr`` covers the full 0-1 range so the tuner can converge
+        on the standard 0.5 — our previous 0-0.5 cap excluded the best
+        value for laterally symmetric classes (car, bus, person, ...).
+      * ``close_mosaic`` is tuned — the mosaic-shutdown window is one
+        of the strongest knobs for small-object detection because
+        mosaic distortion hurts the final fine-tuning epochs.
+      * ``cutmix`` and ``copy_paste`` are both enabled with conservative
+        upper bounds — both help VisDrone's many-small-objects regime
+        without destroying the tiny bounding boxes.
+      * ``shear`` and ``perspective`` are **intentionally omitted** —
+        they destroy small-object bboxes via pixel interpolation loss.
+      * ``box`` loss gain range is pushed up (5-12) to let the tuner
+        emphasise localisation accuracy, which matters most for the
+        tiny boxes that dominate VisDrone.
+
+    Note: ``dfl`` only applies to YOLO11 models. YOLO26 is NMS-free and
+    removes the Distribution Focal Loss head entirely, so the ``dfl``
+    gain has no effect on YOLO26n / YOLO26s trials.
     """
     from ray import tune
 
@@ -79,22 +102,39 @@ def build_search_space():
         "warmup_momentum": tune.uniform(0.5, 0.95),
 
         # --- Loss weights (small-object detection is sensitive here) --
-        "box": tune.uniform(4.0, 10.0),
-        "cls": tune.uniform(0.3, 1.5),
+        # `box` gain is pushed higher than the Ultralytics default (7.5)
+        # to emphasise localisation of the tiny VisDrone bboxes.
+        # `cls` upper bound widened to cover VisDrone's class imbalance
+        # (pedestrian/car dominate, awning-tricycle is rare).
+        # `dfl` applies to YOLO11 only — YOLO26 is DFL-free (see docstring).
+        "box": tune.uniform(5.0, 12.0),
+        "cls": tune.uniform(0.3, 2.0),
         "dfl": tune.uniform(1.0, 3.0),
 
         # --- Augmentation ---------------------------------------------
-        # Small objects are easily destroyed by aggressive scale/shear
+        # Small objects are easily destroyed by aggressive scale/shear,
+        # so `shear` and `perspective` are deliberately omitted.
         "hsv_h":    tune.uniform(0.0, 0.03),
         "hsv_s":    tune.uniform(0.3, 0.9),
         "hsv_v":    tune.uniform(0.2, 0.7),
         "degrees":  tune.uniform(0.0, 10.0),
         "translate": tune.uniform(0.0, 0.2),
         "scale":    tune.uniform(0.2, 0.6),   # narrower than default
-        "fliplr":   tune.uniform(0.0, 0.5),
+        # Aerial imagery has no natural vertical orientation — include
+        # vertical flip (the Ultralytics default tuner also does).
+        "flipud":   tune.uniform(0.0, 0.5),
+        # Full 0-1 range so the tuner can converge on the standard 0.5
+        # for laterally symmetric classes (car, bus, person, ...).
+        "fliplr":   tune.uniform(0.0, 1.0),
         "mosaic":   tune.uniform(0.8, 1.0),   # keep mosaic high
         "mixup":    tune.uniform(0.0, 0.2),
+        "cutmix":   tune.uniform(0.0, 0.3),
         "copy_paste": tune.uniform(0.0, 0.3),
+        # Epochs-before-end to shut mosaic off. Mosaic distortion hurts
+        # final fine-tuning, especially for tiny objects, so exposing
+        # this as a tuned param is one of the stronger small-object
+        # levers available.
+        "close_mosaic": tune.randint(5, 15),
     }
 
 

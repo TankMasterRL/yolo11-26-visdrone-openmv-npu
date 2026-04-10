@@ -321,6 +321,44 @@ selected model. Ray Tune orchestrates an **ASHA scheduler**
 written to `runs/tune/visdrone_raytune_<model>_best_hyperparameters.json`.
 A summary table of per-model mAP is printed at the end.
 
+### VisDrone hyperparameter audit
+
+The VisDrone-focused search space in `tune_hyperparameters.py`
+`build_search_space()` is a deliberately narrowed subset of the
+Ultralytics default ([`ultralytics/utils/tuner.py`](https://github.com/ultralytics/ultralytics/blob/main/ultralytics/utils/tuner.py)
+`run_ray_tune`), audited against the Ultralytics community thread on
+[training YOLO11/YOLO12 on VisDrone](https://community.ultralytics.com/t/standard-epochs-and-imgsz-for-training-yolo11-yolov12-on-visdrone-dataset/1614).
+Notable VisDrone-specific decisions:
+
+- **`flipud` is included** (`0.0 – 0.5`). Aerial imagery has no natural
+  vertical orientation, so vertical flip roughly doubles the effective
+  dataset with zero label cost.
+- **`fliplr` uses the full `0.0 – 1.0` range** so the tuner can settle
+  on the standard `0.5` for laterally symmetric classes (car, bus,
+  person, ...). An earlier 0 – 0.5 cap excluded the best value.
+- **`close_mosaic` is tuned** (`randint(5, 15)`). The mosaic-shutdown
+  window is one of the strongest levers for small-object detection —
+  mosaic distortion hurts the final fine-tuning epochs.
+- **`cutmix` and `copy_paste` are both enabled** with conservative
+  upper bounds (0.3 each). Both help VisDrone's many-small-objects
+  regime without destroying tiny bounding boxes.
+- **`box` gain is pushed higher** (`5.0 – 12.0` vs. default 7.5) to
+  emphasise localisation accuracy on tiny boxes.
+- **`shear` and `perspective` are deliberately omitted** — both
+  destroy small-object bboxes via pixel interpolation loss.
+- **Training defaults** in `train_and_export.py` now enable
+  `multi_scale=True` per the community recommendation — the model
+  sees each batch at ±50% of the nominal `imgsz`, which helps the
+  tiny-object regime without needing to bump `imgsz` (which we can't
+  afford given the 256/320 OpenMV export targets).
+
+> **YOLO26 note:** YOLO26 is NMS-free and removes the Distribution
+> Focal Loss head, so the `dfl` gain has **no effect** on YOLO26n /
+> YOLO26s trials. The parameter is still sampled (so YOLO11 trials
+> benefit) but YOLO26 trials with different `dfl` values are
+> effectively duplicates — the tuner will converge around the mean
+> regardless.
+
 ### Visualise with TensorBoard
 
 Ultralytics writes TFEvent logs for each trial automatically. Launch

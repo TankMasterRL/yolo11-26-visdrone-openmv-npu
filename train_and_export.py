@@ -77,7 +77,10 @@ BOARDS = {
     },
 }
 
-# Default training hyper-parameters (tuned for small-object drone imagery)
+# Default training hyper-parameters (tuned for small-object drone imagery).
+# See the "Hyperparameter audit" section of the README for the rationale
+# behind each non-default choice and the cross-references to the Ultralytics
+# docs / community thread that motivates them.
 DEFAULT_TRAIN_ARGS = dict(
     data=VISDRONE_YAML,
     epochs=100,
@@ -87,6 +90,11 @@ DEFAULT_TRAIN_ARGS = dict(
     optimizer="auto",
     cos_lr=True,
     close_mosaic=10,
+    # Community-recommended for VisDrone: vary the training resolution
+    # within ±50% per batch so the model sees objects at many pixel
+    # sizes. Helps the tiny-object regime without needing to bump imgsz
+    # (which we can't afford given the 256/320 OpenMV export targets).
+    multi_scale=True,
     cache="disk",
     workers=8,
     verbose=True,
