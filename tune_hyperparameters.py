@@ -4,8 +4,20 @@ Hyperparameter Tuning for YOLO on VisDrone with Ray Tune + TensorBoard
 ========================================================================
 
 Wraps Ultralytics' built-in ``model.tune(use_ray=True)`` integration
-(see https://docs.ultralytics.com/integrations/ray-tune/) with a
-VisDrone-focused search space tuned for small-object drone imagery.
+(see https://docs.ultralytics.com/integrations/ray-tune/) with
+model-family-aware search spaces tuned for VisDrone small-object
+drone imagery:
+
+  * YOLO11n / YOLO11s → VisDrone-audited YOLO11 space.
+  * YOLO26n           → space bracketed around the official YOLO26n
+                        training recipe (DFL-heavy, aggressive scale).
+  * YOLO26s           → space bracketed around the official YOLO26s
+                        training recipe (box-heavy, gentle LR decay,
+                        no rotation / shear).
+
+The YOLO26 spaces follow https://docs.ultralytics.com/guides/yolo26-training-recipe/
+because the nano and small recipes differ sharply — see
+``_visdrone_yolo26n_space`` and ``_visdrone_yolo26s_space`` below.
 
 By default, runs an independent tuning sweep for **all four models**
 (YOLO11n, YOLO11s, YOLO26n, YOLO26s) — each gets its own Ray Tune
@@ -59,13 +71,32 @@ ALL_MODELS = {
 }
 
 
-def build_search_space():
+def _visdrone_yolo11_space():
     """
-    VisDrone-focused hyperparameter search space.
+    VisDrone-focused hyperparameter search space for YOLO11.
 
-    The default Ultralytics space covers 28 parameters; we narrow it to
-    the ones that matter most for small-object drone detection and
-    tighten some ranges based on common VisDrone training practice.
+    Derived from Ultralytics' default ``run_ray_tune`` space in
+    ``ultralytics/utils/tuner.py`` and audited against the community
+    recommendations on the Ultralytics forum for VisDrone / small-object
+    drone imagery. Notable VisDrone-specific decisions:
+
+      * ``flipud`` is included (Ultralytics default keeps it) — aerial
+        imagery has no natural "up" and enabling vertical flip roughly
+        doubles the effective dataset with zero label cost.
+      * ``fliplr`` covers the full 0-1 range so the tuner can converge
+        on the standard 0.5 — our previous 0-0.5 cap excluded the best
+        value for laterally symmetric classes (car, bus, person, ...).
+      * ``close_mosaic`` is tuned — the mosaic-shutdown window is one
+        of the strongest knobs for small-object detection because
+        mosaic distortion hurts the final fine-tuning epochs.
+      * ``cutmix`` and ``copy_paste`` are both enabled with conservative
+        upper bounds — both help VisDrone's many-small-objects regime
+        without destroying the tiny bounding boxes.
+      * ``shear`` and ``perspective`` are **intentionally omitted** —
+        they destroy small-object bboxes via pixel interpolation loss.
+      * ``box`` loss gain range is pushed up (5-12) to let the tuner
+        emphasise localisation accuracy, which matters most for the
+        tiny boxes that dominate VisDrone.
     """
     from ray import tune
 
@@ -79,23 +110,176 @@ def build_search_space():
         "warmup_momentum": tune.uniform(0.5, 0.95),
 
         # --- Loss weights (small-object detection is sensitive here) --
-        "box": tune.uniform(4.0, 10.0),
-        "cls": tune.uniform(0.3, 1.5),
+        # `box` gain is pushed higher than the Ultralytics default (7.5)
+        # to emphasise localisation of the tiny VisDrone bboxes.
+        # `cls` upper bound widened to cover VisDrone's class imbalance
+        # (pedestrian/car dominate, awning-tricycle is rare).
+        "box": tune.uniform(5.0, 12.0),
+        "cls": tune.uniform(0.3, 2.0),
         "dfl": tune.uniform(1.0, 3.0),
 
         # --- Augmentation ---------------------------------------------
-        # Small objects are easily destroyed by aggressive scale/shear
+        # Small objects are easily destroyed by aggressive scale/shear,
+        # so `shear` and `perspective` are deliberately omitted.
         "hsv_h":    tune.uniform(0.0, 0.03),
         "hsv_s":    tune.uniform(0.3, 0.9),
         "hsv_v":    tune.uniform(0.2, 0.7),
         "degrees":  tune.uniform(0.0, 10.0),
         "translate": tune.uniform(0.0, 0.2),
         "scale":    tune.uniform(0.2, 0.6),   # narrower than default
-        "fliplr":   tune.uniform(0.0, 0.5),
+        # Aerial imagery has no natural vertical orientation — include
+        # vertical flip (the Ultralytics default tuner also does).
+        "flipud":   tune.uniform(0.0, 0.5),
+        # Full 0-1 range so the tuner can converge on the standard 0.5
+        # for laterally symmetric classes (car, bus, person, ...).
+        "fliplr":   tune.uniform(0.0, 1.0),
         "mosaic":   tune.uniform(0.8, 1.0),   # keep mosaic high
         "mixup":    tune.uniform(0.0, 0.2),
+        "cutmix":   tune.uniform(0.0, 0.3),
         "copy_paste": tune.uniform(0.0, 0.3),
+        # Epochs-before-end to shut mosaic off. Mosaic distortion hurts
+        # final fine-tuning, especially for tiny objects, so exposing
+        # this as a tuned param is one of the stronger small-object
+        # levers available.
+        "close_mosaic": tune.randint(5, 15),
     }
+
+
+def _visdrone_yolo26n_space():
+    """
+    VisDrone × YOLO26n search space.
+
+    Bracketed around the official YOLO26 training recipe values for the
+    nano variant (see https://docs.ultralytics.com/guides/yolo26-training-recipe/).
+    YOLO26 uses the new MuSGD optimiser and Small-Target-Aware Label
+    Assignment (STAL), which tolerates more aggressive geometric
+    augmentation than YOLO11 — so this space allows ``shear`` (recipe
+    uses 1.46) and a higher ``scale``. The nano recipe prioritises
+    ``dfl`` heavily (recipe value: 9.04), so the DFL range is pushed
+    way above YOLO11's.
+
+    Recipe anchors for reference:
+        lr0=0.0054, lrf=0.0495, momentum=0.947, weight_decay=0.00064,
+        warmup_epochs=0.98, box=5.63, cls=0.56, dfl=9.04,
+        mosaic=0.909, mixup=0.012, copy_paste=0.075,
+        scale=0.562, degrees=1.11, shear=1.46, fliplr=0.606.
+    """
+    from ray import tune
+
+    return {
+        # --- Optimiser (MuSGD) ----------------------------------------
+        "lr0":          tune.loguniform(1e-3, 1e-2),   # ~0.0054
+        "lrf":          tune.uniform(0.02, 0.10),      # ~0.0495
+        "momentum":     tune.uniform(0.92, 0.97),      # ~0.947
+        "weight_decay": tune.uniform(1e-4, 1e-3),      # ~0.00064
+        "warmup_epochs":   tune.uniform(0.0, 3.0),     # ~0.98
+        "warmup_momentum": tune.uniform(0.5, 0.95),
+
+        # --- Loss weights ---------------------------------------------
+        # YOLO26n prioritises DFL: recipe value 9.04.
+        "box": tune.uniform(4.0, 8.0),                 # ~5.63
+        "cls": tune.uniform(0.3, 1.0),                 # ~0.56
+        "dfl": tune.uniform(6.0, 12.0),                # ~9.04
+
+        # --- Augmentation ---------------------------------------------
+        # STAL tolerates aggressive geometry: shear is allowed.
+        "hsv_h":    tune.uniform(0.0, 0.03),
+        "hsv_s":    tune.uniform(0.3, 0.9),
+        "hsv_v":    tune.uniform(0.2, 0.7),
+        "degrees":  tune.uniform(0.0, 3.0),            # ~1.11
+        "translate": tune.uniform(0.0, 0.2),
+        "scale":    tune.uniform(0.4, 0.7),            # ~0.562
+        "shear":    tune.uniform(0.0, 3.0),            # ~1.46
+        # Aerial imagery — keep flipud on.
+        "flipud":   tune.uniform(0.0, 0.5),
+        "fliplr":   tune.uniform(0.4, 0.8),            # ~0.606
+        "mosaic":   tune.uniform(0.85, 1.0),           # ~0.909
+        "mixup":    tune.uniform(0.0, 0.05),           # ~0.012
+        "copy_paste": tune.uniform(0.0, 0.2),          # ~0.075
+        "close_mosaic": tune.randint(5, 15),           # recipe: 10
+    }
+
+
+def _visdrone_yolo26s_space():
+    """
+    VisDrone × YOLO26s search space.
+
+    Bracketed around the official YOLO26 training recipe values for the
+    small variant (see https://docs.ultralytics.com/guides/yolo26-training-recipe/).
+    The S/M/L/X recipes differ sharply from N — much lower ``lr0``,
+    gentler LR decay (high ``lrf``), higher ``box`` loss gain, and
+    de-emphasised ``dfl``. The recipe also zeroes out rotation and
+    shear for S, so those ranges are correspondingly narrow.
+
+    Recipe anchors for reference:
+        lr0=0.00038, lrf=0.882, momentum=0.948, weight_decay=0.00027,
+        warmup_epochs=0.99, box=9.83, cls=0.65, dfl=0.96,
+        mosaic=0.992, mixup=0.05, copy_paste=0.304,
+        scale=0.9, degrees=0.0, shear=0.0, fliplr=0.304.
+    """
+    from ray import tune
+
+    return {
+        # --- Optimiser (MuSGD) ----------------------------------------
+        "lr0":          tune.loguniform(1e-4, 1e-3),   # ~0.00038
+        "lrf":          tune.uniform(0.5, 1.0),        # ~0.882
+        "momentum":     tune.uniform(0.92, 0.97),      # ~0.948
+        "weight_decay": tune.uniform(1e-4, 1e-3),      # ~0.00027
+        "warmup_epochs":   tune.uniform(0.0, 3.0),     # ~0.99
+        "warmup_momentum": tune.uniform(0.5, 0.95),
+
+        # --- Loss weights ---------------------------------------------
+        # S/M/L/X de-emphasise DFL (recipe: 0.96) and push box (9.83).
+        "box": tune.uniform(7.0, 13.0),                # ~9.83
+        "cls": tune.uniform(0.3, 1.2),                 # ~0.65
+        "dfl": tune.uniform(0.5, 2.0),                 # ~0.96
+
+        # --- Augmentation ---------------------------------------------
+        # Recipe zeros out rotation and shear for S — keep them near 0.
+        "hsv_h":    tune.uniform(0.0, 0.03),
+        "hsv_s":    tune.uniform(0.3, 0.9),
+        "hsv_v":    tune.uniform(0.2, 0.7),
+        "degrees":  tune.uniform(0.0, 1.0),            # ~0.0
+        "translate": tune.uniform(0.0, 0.2),
+        "scale":    tune.uniform(0.6, 0.9),            # ~0.9
+        "shear":    tune.uniform(0.0, 0.5),            # ~0.0
+        # Aerial imagery — keep flipud on.
+        "flipud":   tune.uniform(0.0, 0.5),
+        "fliplr":   tune.uniform(0.2, 0.5),            # ~0.304
+        "mosaic":   tune.uniform(0.9, 1.0),            # ~0.992
+        "mixup":    tune.uniform(0.0, 0.1),            # ~0.05
+        "copy_paste": tune.uniform(0.1, 0.4),          # ~0.304
+        "close_mosaic": tune.randint(5, 15),           # recipe: 10
+    }
+
+
+def build_search_space(model_key: str):
+    """
+    Return a Ray Tune search space tailored to ``model_key``.
+
+    Three families are supported:
+
+      * ``yolo11n`` / ``yolo11s`` → VisDrone-audited YOLO11 space.
+      * ``yolo26n``               → space bracketed around the YOLO26n
+                                    training recipe (DFL-heavy).
+      * ``yolo26s``               → space bracketed around the YOLO26s
+                                    training recipe (box-heavy,
+                                    gentle LR decay).
+
+    YOLO26 variants get distinct spaces because the official training
+    recipe (https://docs.ultralytics.com/guides/yolo26-training-recipe/)
+    differs sharply between the nano and small variants in ``lr0``,
+    ``lrf``, ``box`` / ``dfl`` gain, and geometric augmentation. YOLO26
+    also uses Small-Target-Aware Label Assignment (STAL) which tolerates
+    more aggressive ``scale`` / ``shear`` than YOLO11.
+    """
+    if model_key == "yolo26n":
+        return _visdrone_yolo26n_space()
+    if model_key == "yolo26s":
+        return _visdrone_yolo26s_space()
+    # yolo11n, yolo11s, and any unknown key fall through to the
+    # VisDrone-audited YOLO11 baseline.
+    return _visdrone_yolo11_space()
 
 
 def parse_args() -> argparse.Namespace:
@@ -145,7 +329,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--default-space", action="store_true",
         help="Use Ultralytics' full default 28-parameter search space "
-             "instead of the VisDrone-tuned one",
+             "instead of the VisDrone-/model-family-tuned one",
     )
     return p.parse_args()
 
@@ -190,7 +374,7 @@ def tune_one_model(
     if args.gpu_per_trial is not None:
         tune_kwargs["gpu_per_trial"] = args.gpu_per_trial
     if not args.default_space:
-        tune_kwargs["space"] = build_search_space()
+        tune_kwargs["space"] = build_search_space(model_key)
 
     try:
         result_grid = model.tune(**tune_kwargs)
@@ -266,7 +450,7 @@ def main() -> None:
     print(f"  Image size   : {args.imgsz}")
     print(f"  GPU/trial    : {args.gpu_per_trial if args.gpu_per_trial else 'auto'}")
     print(f"  Output       : {output_dir}")
-    print(f"  Search space : {'default (28 params)' if args.default_space else 'VisDrone-tuned'}")
+    print(f"  Search space : {'default (28 params)' if args.default_space else 'VisDrone + model-family tuned'}")
     print("=" * 72)
 
     # ------------------------------------------------------------------

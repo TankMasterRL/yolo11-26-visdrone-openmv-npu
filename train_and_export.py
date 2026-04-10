@@ -77,7 +77,10 @@ BOARDS = {
     },
 }
 
-# Default training hyper-parameters (tuned for small-object drone imagery)
+# Default training hyper-parameters (tuned for small-object drone imagery).
+# See the "Hyperparameter audit" section of the README for the rationale
+# behind each non-default choice and the cross-references to the Ultralytics
+# docs / community thread that motivates them.
 DEFAULT_TRAIN_ARGS = dict(
     data=VISDRONE_YAML,
     epochs=100,
@@ -87,6 +90,11 @@ DEFAULT_TRAIN_ARGS = dict(
     optimizer="auto",
     cos_lr=True,
     close_mosaic=10,
+    # Community-recommended for VisDrone: vary the training resolution
+    # within ±50% per batch so the model sees objects at many pixel
+    # sizes. Helps the tiny-object regime without needing to bump imgsz
+    # (which we can't afford given the 256/320 OpenMV export targets).
+    multi_scale=True,
     cache="disk",
     workers=8,
     verbose=True,
@@ -100,6 +108,70 @@ DEFAULT_EXPORT_ARGS = dict(
     data=VISDRONE_YAML,  # calibration data
     nms=False,           # no NMS baked in – post-process on device
 )
+
+# ---------------------------------------------------------------------------
+# Per-model training overrides
+# ---------------------------------------------------------------------------
+#
+# YOLO26n / YOLO26s ship with a distinct, well-published training recipe
+# that differs sharply from YOLO11 defaults — different optimiser (MuSGD),
+# much lower lr0 for S, higher DFL gain for N, aggressive scale, etc. See
+# https://docs.ultralytics.com/guides/yolo26-training-recipe/.
+#
+# The table below mirrors that recipe verbatim for the hyperparameters
+# the recipe specifies. Anything not listed falls back to
+# ``DEFAULT_TRAIN_ARGS`` above (which is the VisDrone-audited baseline
+# used for YOLO11 and as a generic starting point). Epochs / patience /
+# imgsz / batch are intentionally left to the CLI so users can still
+# drive runtime from --epochs / --imgsz on the command line.
+MODEL_TRAIN_OVERRIDES: dict[str, dict] = {
+    "yolo26n": dict(
+        # Optimiser schedule — YOLO26n uses a relatively high lr0 with
+        # steep decay, per the recipe.
+        lr0=0.0054,
+        lrf=0.0495,
+        momentum=0.947,
+        weight_decay=0.00064,
+        warmup_epochs=0.98,
+        # Loss gains — YOLO26n prioritises DFL.
+        box=5.63,
+        cls=0.56,
+        dfl=9.04,
+        # Augmentation — recipe values.
+        mosaic=0.909,
+        mixup=0.012,
+        copy_paste=0.075,
+        scale=0.562,
+        degrees=1.11,
+        shear=1.46,
+        fliplr=0.606,
+        close_mosaic=10,
+    ),
+    "yolo26s": dict(
+        # Optimiser schedule — YOLO26s uses a much lower initial LR
+        # with gentle decay, per the recipe.
+        lr0=0.00038,
+        lrf=0.882,
+        momentum=0.948,
+        weight_decay=0.00027,
+        warmup_epochs=0.99,
+        # Loss gains — S/M/L/X shift emphasis from DFL to box regression.
+        box=9.83,
+        cls=0.65,
+        dfl=0.96,
+        # Augmentation — recipe values. Note the aggressive scale
+        # (0.9) is tolerable on YOLO26 because its Small-Target-Aware
+        # Label Assignment (STAL) head is robust to tiny boxes.
+        mosaic=0.992,
+        mixup=0.05,
+        copy_paste=0.304,
+        scale=0.9,
+        degrees=0.0,
+        shear=0.0,
+        fliplr=0.304,
+        close_mosaic=10,
+    ),
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -139,7 +211,16 @@ def train_model(
 
     model = YOLO(pretrained)
 
+    # Start from the VisDrone-audited baseline, then layer any per-model
+    # overrides from the YOLO26 training recipe on top (see the
+    # MODEL_TRAIN_OVERRIDES table above for the rationale).
     train_args = {**DEFAULT_TRAIN_ARGS}
+    overrides = MODEL_TRAIN_OVERRIDES.get(model_name)
+    if overrides:
+        print(f"  Applying {model_name} training recipe overrides "
+              f"({len(overrides)} hyperparameters)")
+        train_args.update(overrides)
+
     train_args["imgsz"] = imgsz
     train_args["epochs"] = epochs
     train_args["project"] = str(project_dir)

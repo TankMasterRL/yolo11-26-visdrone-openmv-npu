@@ -321,6 +321,86 @@ selected model. Ray Tune orchestrates an **ASHA scheduler**
 written to `runs/tune/visdrone_raytune_<model>_best_hyperparameters.json`.
 A summary table of per-model mAP is printed at the end.
 
+### VisDrone hyperparameter audit
+
+The VisDrone-focused search spaces in `tune_hyperparameters.py`
+`build_search_space()` are deliberately narrowed subsets of the
+Ultralytics default ([`ultralytics/utils/tuner.py`](https://github.com/ultralytics/ultralytics/blob/main/ultralytics/utils/tuner.py)
+`run_ray_tune`), audited against the Ultralytics community thread on
+[training YOLO11/YOLO12 on VisDrone](https://community.ultralytics.com/t/standard-epochs-and-imgsz-for-training-yolo11-yolov12-on-visdrone-dataset/1614)
+and — for YOLO26n / YOLO26s — the official
+[YOLO26 training recipe](https://docs.ultralytics.com/guides/yolo26-training-recipe/).
+`build_search_space(model_key)` dispatches on the model family so each
+variant gets a recipe-aware space:
+
+- **YOLO11n / YOLO11s** → VisDrone-audited YOLO11 space.
+- **YOLO26n** → DFL-heavy space (`dfl` 6.0 – 12.0, recipe anchor 9.04),
+  aggressive `scale` / `shear` permitted by STAL label assignment.
+- **YOLO26s** → box-heavy space (`box` 7.0 – 13.0, recipe anchor 9.83),
+  de-emphasised `dfl` (0.5 – 2.0), `lr0` one order of magnitude lower
+  than YOLO26n, and `degrees` / `shear` pinned near zero per the recipe.
+
+Notable VisDrone-specific decisions in the YOLO11 space:
+
+- **`flipud` is included** (`0.0 – 0.5`). Aerial imagery has no natural
+  vertical orientation, so vertical flip roughly doubles the effective
+  dataset with zero label cost.
+- **`fliplr` uses the full `0.0 – 1.0` range** so the tuner can settle
+  on the standard `0.5` for laterally symmetric classes (car, bus,
+  person, ...). An earlier 0 – 0.5 cap excluded the best value.
+- **`close_mosaic` is tuned** (`randint(5, 15)`). The mosaic-shutdown
+  window is one of the strongest levers for small-object detection —
+  mosaic distortion hurts the final fine-tuning epochs.
+- **`cutmix` and `copy_paste` are both enabled** with conservative
+  upper bounds (0.3 each). Both help VisDrone's many-small-objects
+  regime without destroying tiny bounding boxes.
+- **`box` gain is pushed higher** (`5.0 – 12.0` vs. default 7.5) to
+  emphasise localisation accuracy on tiny boxes.
+- **`shear` and `perspective` are deliberately omitted** — both
+  destroy small-object bboxes via pixel interpolation loss.
+- **Training defaults** in `train_and_export.py` now enable
+  `multi_scale=True` per the community recommendation — the model
+  sees each batch at ±50% of the nominal `imgsz`, which helps the
+  tiny-object regime without needing to bump `imgsz` (which we can't
+  afford given the 256/320 OpenMV export targets).
+
+### YOLO26 training recipe integration
+
+YOLO26 ships with an official training recipe that differs sharply
+from YOLO11 defaults — new MuSGD optimiser, end-to-end NMS-free head,
+Small-Target-Aware Label Assignment (STAL), and distinct per-size
+hyperparameters. `train_and_export.py` layers a
+`MODEL_TRAIN_OVERRIDES` table on top of `DEFAULT_TRAIN_ARGS` so the
+YOLO11 VisDrone baseline is preserved for YOLO11n / YOLO11s while
+YOLO26n and YOLO26s get their recipe values applied verbatim:
+
+| Hyperparameter | YOLO26n recipe | YOLO26s recipe |
+|----------------|---------------:|---------------:|
+| `lr0`          | 0.0054         | 0.00038        |
+| `lrf`          | 0.0495         | 0.882          |
+| `momentum`     | 0.947          | 0.948          |
+| `weight_decay` | 0.00064        | 0.00027        |
+| `box`          | 5.63           | 9.83           |
+| `cls`          | 0.56           | 0.65           |
+| `dfl`          | 9.04           | 0.96           |
+| `mosaic`       | 0.909          | 0.992          |
+| `mixup`        | 0.012          | 0.05           |
+| `copy_paste`   | 0.075          | 0.304          |
+| `scale`        | 0.562          | 0.9            |
+| `degrees`      | 1.11           | 0.0            |
+| `shear`        | 1.46           | 0.0            |
+| `fliplr`       | 0.606          | 0.304          |
+| `close_mosaic` | 10             | 10             |
+
+Note the sharp split between the nano and small variants: YOLO26n
+prioritises **DFL** (`dfl=9.04`) with a relatively high `lr0` and
+aggressive geometry, while YOLO26s prioritises **box regression**
+(`box=9.83`) with a much lower `lr0`, near-unity `lrf` (gentle LR
+decay) and zeroed rotation / shear. The Ray Tune search spaces in
+`_visdrone_yolo26n_space()` and `_visdrone_yolo26s_space()` bracket
+these recipe anchors so the tuner can refine around — not regress
+away from — the published values.
+
 ### Visualise with TensorBoard
 
 Ultralytics writes TFEvent logs for each trial automatically. Launch
