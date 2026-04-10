@@ -90,11 +90,23 @@ DEFAULT_TRAIN_ARGS = dict(
     optimizer="auto",
     cos_lr=True,
     close_mosaic=10,
-    # Community-recommended for VisDrone: vary the training resolution
-    # within ±50% per batch so the model sees objects at many pixel
-    # sizes. Helps the tiny-object regime without needing to bump imgsz
-    # (which we can't afford given the 256/320 OpenMV export targets).
-    multi_scale=True,
+    # NOTE: ``multi_scale=True`` is intentionally **disabled**.
+    # Ultralytics' multi-scale path calls
+    # ``nn.functional.interpolate(imgs, size=ns, mode="bilinear", ...)``
+    # inside ``DetectionTrainer.preprocess_batch``. On the PyTorch 2.x
+    # builds shipped with Google Colab (and other environments where
+    # AMP autocast routes the call through ``torch._decomp``), the
+    # upsample decomposition crashes inside ``_compute_scale`` with
+    # ``ZeroDivisionError: division by zero`` because ``out_size``
+    # comes through as 0. The bug is upstream in PyTorch and not
+    # something we can patch from the training script.
+    #
+    # The community-recommended small-object benefit is largely
+    # recovered via the ``scale`` / ``mosaic`` / ``copy_paste`` ranges
+    # already tuned by the Ray Tune search space, so the loss is
+    # mostly cosmetic. Re-enable once Colab ships a PyTorch with the
+    # decomposition fix.
+    multi_scale=False,
     cache="disk",
     workers=8,
     verbose=True,

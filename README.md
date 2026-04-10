@@ -358,11 +358,16 @@ Notable VisDrone-specific decisions in the YOLO11 space:
   emphasise localisation accuracy on tiny boxes.
 - **`shear` and `perspective` are deliberately omitted** — both
   destroy small-object bboxes via pixel interpolation loss.
-- **Training defaults** in `train_and_export.py` now enable
-  `multi_scale=True` per the community recommendation — the model
-  sees each batch at ±50% of the nominal `imgsz`, which helps the
-  tiny-object regime without needing to bump `imgsz` (which we can't
-  afford given the 256/320 OpenMV export targets).
+- **`multi_scale` is intentionally disabled** in `DEFAULT_TRAIN_ARGS`.
+  The Ultralytics multi-scale path calls
+  `nn.functional.interpolate(imgs, size=ns, mode="bilinear", ...)`
+  inside `DetectionTrainer.preprocess_batch`, and on the PyTorch 2.x
+  builds shipped with Google Colab the upsample decomposition crashes
+  inside `_compute_scale` with `ZeroDivisionError: division by zero`
+  (the bug is upstream in PyTorch). The small-object benefit is
+  largely recovered through the `scale`, `mosaic` and `copy_paste`
+  ranges already covered by the Ray Tune search space. Re-enable
+  once Colab ships a PyTorch with the decomposition fix.
 
 ### YOLO26 training recipe integration
 
