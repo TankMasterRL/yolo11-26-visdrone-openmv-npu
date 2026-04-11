@@ -441,13 +441,25 @@ def _make_run_config(name: str, output_dir: Path):
     Build a Ray ``RunConfig`` that works across Ray 2.x versions
     (the class moved from ``ray.tune`` to ``ray.train`` in 2.7+).
     ``storage_path`` must be absolute for Ray.
+
+    We force ``verbose=1`` (an int) to side-step a Ray Tune bug
+    observed on the Ray 2.x build shipped with Google Colab:
+    ``RunConfig.verbose`` defaults to a *string* (read from an env
+    var like ``RAY_AIR_VERBOSITY``), and ``get_air_verbosity`` then
+    crashes inside ``ray/tune/experimental/output.py`` with::
+
+        AttributeError: 'str' object has no attribute 'value'
+
+    because it does ``verbose if isinstance(verbose, int) else
+    verbose.value`` and a bare string has no ``.value`` attribute.
+    Passing an explicit int bypasses the env-var path entirely.
     """
     storage = str(output_dir.resolve())
     try:
         from ray.train import RunConfig  # type: ignore
     except ImportError:
         from ray.tune import RunConfig  # type: ignore
-    return RunConfig(name=name, storage_path=storage)
+    return RunConfig(name=name, storage_path=storage, verbose=1)
 
 
 def _resolve_gpus_per_trial(gpu_per_trial_arg: float | None) -> float:
