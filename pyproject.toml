@@ -8,7 +8,11 @@ authors = [
     { name = "TankMasterRL" },
 ]
 dependencies = [
-    "ultralytics>=8.3.0",
+    # 8.4.33 added ``search_alg`` forwarding to ``run_ray_tune``
+    # (PR ultralytics/ultralytics#23946) which is what lets us drive
+    # ``model.tune(use_ray=True, search_alg=OptunaSearch(...))`` from
+    # ``tune_hyperparameters.py`` without a custom ``tune.Tuner`` wrapper.
+    "ultralytics>=8.4.33",
 ]
 
 [project.optional-dependencies]
@@ -40,7 +44,7 @@ export = [
 ]
 # Convenience group for everything installable via pip
 all = [
-    "ultralytics>=8.3.0",
+    "ultralytics>=8.4.33",
     "ethos-u-vela>=3.12.0",
     "ray[tune]>=2.10.0",
     "optuna>=3.4.0",

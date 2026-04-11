@@ -3,21 +3,21 @@
 Hyperparameter Tuning for YOLO on VisDrone with Ray Tune + Optuna
 ========================================================================
 
-In-house Ray Tune driver that runs one **OptunaSearch** (TPE) sweep
-per model, with an ASHA scheduler for early stopping. The YOLO26
-sweeps are **warm-started** by seeding Optuna's
-``points_to_evaluate`` with the official YOLO26 training recipe
-(see https://docs.ultralytics.com/guides/yolo26-training-recipe/),
-so trial #0 is guaranteed to be the published baseline and the
-remaining budget refines around it.
+Drives Ultralytics' built-in Ray Tune integration
+(``model.tune(use_ray=True, ...)``) with a model-family-aware search
+space and an **OptunaSearch** (TPE) algorithm warm-started from the
+official YOLO26 training recipe (see
+https://docs.ultralytics.com/guides/yolo26-training-recipe/). Trial #0
+of every YOLO26 sweep is therefore guaranteed to reproduce the
+published baseline, with the rest of the budget refining around it.
 
-Why we do NOT use ``model.tune(use_ray=True)``:
-    Ultralytics' built-in Ray Tune integration
-    (``ultralytics/utils/tuner.py::run_ray_tune``) hard-codes Ray's
-    default ``BasicVariantGenerator`` (random search) and does not
-    forward a ``search_alg`` argument. To use Optuna + recipe
-    warm-starting we therefore build the ``tune.Tuner`` ourselves and
-    call ``YOLO(weights).train(**config)`` from our own trainable.
+Ultralytics ≥ 8.4.33 (PR ultralytics/ultralytics#23946) added
+``search_alg`` forwarding to ``run_ray_tune``, which is what lets us
+pass a pre-instantiated ``OptunaSearch(points_to_evaluate=[...])``
+straight through. Previous releases hard-coded
+``BasicVariantGenerator`` (random search), so this script used to
+build its own ``tune.Tuner`` on top of a custom trainable — that
+workaround has been removed.
 
 Model-family-aware search spaces:
     * YOLO11n / YOLO11s → VisDrone-audited YOLO11 space.
@@ -31,8 +31,11 @@ Model-family-aware search spaces:
     recipes differ sharply — see ``_visdrone_yolo26n_space`` and
     ``_visdrone_yolo26s_space`` below.
 
-Ray Tune uses the ASHA scheduler – trials that underperform are
-stopped early, so ``--iterations`` can be set relatively high.
+Ultralytics builds its own ``ASHAScheduler`` internally (time_attr=
+"epoch", metric="metrics/mAP50-95(B)", mode="max", reduction_factor=3)
+and wires per-epoch metric reporting into the YOLO training callback,
+so trials that underperform are stopped early and ``--iterations``
+can be set relatively high.
 
 TensorBoard integration:
     Ultralytics writes per-trial TFEvent logs into each trial's
@@ -484,142 +487,6 @@ def _recipe_seed_for(model_key: str, space: dict) -> list[dict] | None:
     return [seed] if seed else None
 
 
-def _yolo_tune_trainable(
-    config: dict,
-    *,
-    weights: str,
-    base_kwargs: dict,
-) -> None:
-    """
-    Ray Tune trainable: trains a YOLO model with a sampled
-    ``config`` and reports per-epoch validation metrics back to Ray
-    Tune so the ASHA scheduler can prune under-performing trials.
-
-    Must be defined at module level so Ray can pickle it when
-    dispatching to remote actors. Extra kwargs (``weights``,
-    ``base_kwargs``) are injected via ``tune.with_parameters`` in
-    ``tune_one_model``.
-
-    Reporting API note:
-        We use ``ray.tune.report`` (the canonical Tune Function-API
-        reporter), **not** ``ray.train.report``. The Ray 2.x v2 Train
-        API explicitly deprecates ``ray.train.report`` when called
-        from a function passed to Ray Tune and raises
-        ``DeprecationWarning`` from the report wrapper:
-
-            DeprecationWarning: `ray.train.report` is deprecated when
-            running in a function passed to Ray Tune. Please use the
-            equivalent `ray.tune` API instead.
-
-        See https://github.com/ray-project/ray/issues/49454.
-    """
-    from ultralytics import YOLO
-    from ray import tune as ray_tune
-
-    # Namespace each trial's Ultralytics run directory by the Ray
-    # Tune trial ID so concurrent trials don't stomp on each other's
-    # project dir (important for fractional --gpu-per-trial). The
-    # context module moved between ``ray.tune`` and ``ray.train``
-    # across Ray versions, so try both before giving up.
-    trial_id = None
-    try:
-        trial_id = ray_tune.get_context().get_trial_id()
-    except Exception:
-        try:
-            from ray import train as ray_train
-            trial_id = ray_train.get_context().get_trial_id()
-        except Exception:
-            trial_id = None
-
-    train_kwargs = dict(base_kwargs)
-    train_kwargs.update(config)
-    if trial_id:
-        base_name = train_kwargs.get("name", "trial")
-        train_kwargs["name"] = f"{base_name}_{trial_id}"
-
-    model = YOLO(weights)
-
-    def _on_fit_epoch_end(trainer):
-        raw = getattr(trainer, "metrics", None) or {}
-        metrics: dict[str, float] = {}
-        for k, v in raw.items():
-            try:
-                metrics[k] = float(v)
-            except (TypeError, ValueError):
-                continue
-        metrics["epoch"] = int(getattr(trainer, "epoch", 0))
-        if not metrics:
-            return
-        # Try the dict-style signature first (Ray ≳ 2.5), fall back
-        # to the legacy **kwargs signature on older Ray builds.
-        try:
-            ray_tune.report(metrics)
-        except TypeError:
-            ray_tune.report(**metrics)
-
-    model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
-    model.train(**train_kwargs)
-
-
-def _make_run_config(name: str, output_dir: Path):
-    """
-    Build a Ray ``RunConfig`` that works across Ray 2.x versions
-    (the class moved from ``ray.tune`` to ``ray.train`` in 2.7+).
-    ``storage_path`` must be absolute for Ray.
-
-    Two competing Ray 2.x bugs we have to thread the needle between:
-
-      1. **Older Ray 2.x** (e.g. the build Colab shipped before
-         March 2026): ``RunConfig.verbose`` defaults to a *string*
-         read from ``RAY_AIR_VERBOSITY``, and ``get_air_verbosity``
-         then crashes inside ``ray/tune/experimental/output.py``
-         with::
-
-             AttributeError: 'str' object has no attribute 'value'
-
-         because it does ``verbose if isinstance(verbose, int)
-         else verbose.value``. Workaround: pass an explicit
-         ``verbose=1``.
-
-      2. **Newer Ray 2.x with the v2 Train API** (current Colab
-         build): ``ray.train.RunConfig`` resolves to
-         ``ray.train.v2.api.config.RunConfig``, which has *dropped*
-         the ``verbose`` parameter entirely and raises
-         ``DeprecationWarning`` from ``__post_init__`` if it's
-         passed. Workaround: do **not** pass ``verbose``.
-
-    The fix is to try the old workaround first and fall back on
-    rejection, so the same source works on both Ray builds shipped
-    with Google Colab without us having to detect the version.
-    """
-    storage = str(output_dir.resolve())
-
-    # Prefer ``ray.tune.RunConfig`` since we drive the sweep with
-    # ``ray.tune.Tuner``; fall back to ``ray.train.RunConfig`` if
-    # the tune namespace doesn't re-export it.
-    try:
-        from ray.tune import RunConfig  # type: ignore
-    except ImportError:
-        from ray.train import RunConfig  # type: ignore
-
-    try:
-        return RunConfig(name=name, storage_path=storage, verbose=1)
-    except (TypeError, DeprecationWarning):
-        # Newer v2 RunConfig: ``verbose`` is no longer accepted.
-        return RunConfig(name=name, storage_path=storage)
-
-
-def _resolve_gpus_per_trial(gpu_per_trial_arg: float | None) -> float:
-    """Auto-detect GPU availability if ``--gpu-per-trial`` is not set."""
-    if gpu_per_trial_arg is not None:
-        return float(gpu_per_trial_arg)
-    try:
-        import torch
-        return 1.0 if torch.cuda.is_available() else 0.0
-    except Exception:
-        return 0.0
-
-
 def tune_one_model(
     model_key: str,
     weights: str,
@@ -627,22 +494,39 @@ def tune_one_model(
     output_dir: Path,
 ) -> dict | None:
     """
-    Run an in-house Ray Tune sweep (OptunaSearch TPE + ASHA) for a
-    single model, warm-starting YOLO26 variants from the official
-    training recipe.
+    Run a Ray Tune sweep for a single model via Ultralytics' built-in
+    ``model.tune(use_ray=True, ...)`` integration, warm-starting YOLO26
+    variants from the official training recipe by passing a
+    pre-instantiated ``OptunaSearch(points_to_evaluate=[recipe])``.
+
+    Ultralytics handles all the Ray Tune plumbing internally (trainable
+    dispatch, per-epoch metric reporting callback, ASHA scheduler, and
+    RunConfig), so this function is a thin wrapper around:
+
+      1. Build the model-family-aware search space.
+      2. Build the search algorithm (OptunaSearch with recipe seed for
+         YOLO26, or the string ``"random"`` for plain random search).
+      3. Call ``YOLO(weights).tune(use_ray=True, space=space,
+         search_alg=search_alg, iterations=..., grace_period=...,
+         gpu_per_trial=..., data=..., batch=..., cache=..., ...)``.
+      4. Extract the best trial from the returned ``ResultGrid``.
 
     Returns a summary dict (model, name, best metrics + cfg path) on
     success, or None if the sweep failed.
     """
-    from ray import tune
-    from ray.tune.schedulers import ASHAScheduler
+    from ultralytics import YOLO
 
     exp_name = f"{args.name_prefix}_{model_key}"
     space = build_search_space(model_key)
 
     # ---- Search algorithm ---------------------------------------------
-    search_alg = None
-    search_desc = "Random (BasicVariantGenerator)"
+    # Ultralytics ≥ 8.4.33 resolves a string like "random" / "optuna"
+    # internally, but pre-instantiated searchers are also accepted and
+    # used as-is. We pre-instantiate OptunaSearch so we can attach the
+    # YOLO26 recipe via ``points_to_evaluate`` — the one feature
+    # Ultralytics' string resolver does not expose.
+    search_alg: object
+    search_desc: str
     if args.search_algo == "optuna":
         try:
             from ray.tune.search.optuna import OptunaSearch
@@ -667,42 +551,34 @@ def tune_one_model(
             )
         else:
             search_desc = "OptunaSearch (TPE, cold start)"
+    else:
+        # Plain random – let Ultralytics resolve the string to its
+        # default BasicVariantGenerator.
+        search_alg = "random"
+        search_desc = "Random (BasicVariantGenerator)"
 
-    # ---- Scheduler -----------------------------------------------------
-    # ASHA owns early stopping. max_t / grace_period are expressed in
-    # training_iteration units, which equal epochs thanks to our
-    # per-epoch `ray_train.report` in _yolo_tune_trainable.
-    scheduler = ASHAScheduler(
-        metric=_METRIC_NAME,
-        mode=_METRIC_MODE,
-        max_t=args.epochs,
-        grace_period=args.grace_period,
-        reduction_factor=3,
-    )
-
-    # ---- Resources -----------------------------------------------------
-    gpus_per_trial = _resolve_gpus_per_trial(args.gpu_per_trial)
-
-    # Safety net: if the user shares one GPU across multiple trials but
-    # also leaves --batch on AutoBatch (-1 → 60% GPU mem), each
-    # co-tenant trial will independently try to claim 60% and the
-    # second one will OOM at startup. Warn loudly and recommend a
-    # fractional batch instead. We do not silently override the user's
-    # value — they may be running on a beefy multi-GPU host and want -1.
-    if 0.0 < gpus_per_trial < 1.0 and args.batch == -1:
+    # ---- OOM safety net -----------------------------------------------
+    # If the user shares one GPU across multiple trials but also leaves
+    # --batch on AutoBatch (-1 → 60% GPU mem), each co-tenant trial
+    # will independently try to claim 60% and the second one will OOM
+    # at startup. Warn loudly and recommend a fractional batch instead.
+    # We do not silently override the user's value — they may be
+    # running on a beefy multi-GPU host where 60%/60% is fine.
+    gpt = args.gpu_per_trial
+    if gpt is not None and 0.0 < gpt < 1.0 and args.batch == -1:
         print(
-            f"  ⚠  --gpu-per-trial={gpus_per_trial} with --batch=-1 "
+            f"  ⚠  --gpu-per-trial={gpt} with --batch=-1 "
             f"(AutoBatch 60%% mem): co-tenant trials may OOM. "
-            f"Consider --batch {round(0.5 * gpus_per_trial, 2)} "
+            f"Consider --batch {round(0.5 * gpt, 2)} "
             f"or a fixed integer batch."
         )
 
-    # ---- Base Ultralytics train kwargs shared by all trials -----------
-    # GPU-utilisation knobs are forwarded into every trial here. Without
-    # them Ultralytics' built-in defaults (batch=16, cache=False) leave
-    # the GPU mostly idle during the search; this is the single biggest
-    # speedup for the tuning script.
-    base_train_kwargs = dict(
+    # ---- Training kwargs forwarded into every trial -------------------
+    # Ultralytics' ``run_ray_tune`` merges these into each trial's
+    # ``model.train(**config)`` call via ``config.update(train_args)``,
+    # so our GPU-utilisation knobs (batch / cache / workers / amp)
+    # reach the trainer.
+    train_kwargs: dict = dict(
         data=args.data,
         epochs=args.epochs,
         imgsz=args.imgsz,
@@ -716,7 +592,7 @@ def tune_one_model(
         verbose=False,
     )
     if args.device is not None:
-        base_train_kwargs["device"] = args.device
+        train_kwargs["device"] = args.device
 
     print("\n" + "=" * 72)
     print(f" [{model_key}]  Ray Tune sweep → {exp_name}")
@@ -725,33 +601,22 @@ def tune_one_model(
     print(f"  Iterations   : {args.iterations}")
     print(f"  Epochs/trial : {args.epochs} (grace={args.grace_period})")
     print(f"  Image size   : {args.imgsz}")
-    print(f"  GPU/trial    : {gpus_per_trial}")
+    print(f"  GPU/trial    : {gpt if gpt is not None else 'auto'}")
     print(f"  Batch        : {args.batch}")
     print(f"  Cache / wkrs : {args.cache} / {args.workers}")
     print(f"  Search algo  : {search_desc}")
 
-    trainable = tune.with_parameters(
-        _yolo_tune_trainable,
-        weights=weights,
-        base_kwargs=base_train_kwargs,
-    )
-    trainable = tune.with_resources(
-        trainable, {"cpu": 1, "gpu": gpus_per_trial}
-    )
-
-    tuner = tune.Tuner(
-        trainable,
-        param_space=space,
-        tune_config=tune.TuneConfig(
-            search_alg=search_alg,
-            scheduler=scheduler,
-            num_samples=args.iterations,
-        ),
-        run_config=_make_run_config(exp_name, output_dir),
-    )
-
+    # ---- Dispatch into Ultralytics' built-in Ray Tune integration -----
     try:
-        result_grid = tuner.fit()
+        result_grid = YOLO(weights).tune(
+            use_ray=True,
+            space=space,
+            search_alg=search_alg,
+            iterations=args.iterations,
+            grace_period=args.grace_period,
+            gpu_per_trial=gpt,
+            **train_kwargs,
+        )
     except Exception as e:
         print(f"  ✗ Tuning failed for {model_key}: {e}")
         traceback.print_exc()
