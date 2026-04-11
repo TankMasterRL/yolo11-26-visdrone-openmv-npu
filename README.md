@@ -273,24 +273,39 @@ export/
 
 ---
 
-## 2b. Hyperparameter Tuning (Ray Tune + TensorBoard)
+## 2b. Hyperparameter Tuning (Ray Tune + Optuna + TensorBoard)
 
-This project includes `tune_hyperparameters.py`, a wrapper around
-Ultralytics' built-in
-[Ray Tune integration](https://docs.ultralytics.com/integrations/ray-tune/)
-with a VisDrone-specific search space tuned for small-object drone imagery.
+This project includes `tune_hyperparameters.py`, an in-house
+[Ray Tune](https://docs.ray.io/en/latest/tune/index.html) driver that
+runs one **OptunaSearch** (TPE) sweep per model with an ASHA scheduler
+for early stopping. YOLO26 sweeps are **warm-started** from the
+official [YOLO26 training recipe](https://docs.ultralytics.com/guides/yolo26-training-recipe/)
+via `points_to_evaluate`, so the very first trial is guaranteed to
+reproduce the published baseline and the remaining budget refines
+around it.
+
+> **Why not `model.tune(use_ray=True)`?** Ultralytics' built-in
+> integration (`ultralytics/utils/tuner.py::run_ray_tune`) hard-codes
+> Ray's default `BasicVariantGenerator` (random search) and does
+> **not** forward a `search_alg` argument. To use Optuna + recipe
+> warm-starting we therefore build the `tune.Tuner` ourselves and call
+> `YOLO(weights).train(**config)` from our own trainable
+> (`_yolo_tune_trainable`). Metrics are reported back to Ray Tune
+> per epoch via an `on_fit_epoch_end` callback so ASHA can prune
+> under-performers.
 
 ### Install tuning dependencies
 
 ```bash
-uv sync --extra tune      # pulls in ray[tune] and tensorboard
+uv sync --extra tune      # pulls in ray[tune], optuna and tensorboard
 ```
 
 ### Run a tuning sweep
 
 ```bash
 # Default: runs an independent sweep for ALL FOUR models
-# (yolo11n, yolo11s, yolo26n, yolo26s), 10 trials × 30 epochs each
+# (yolo11n, yolo11s, yolo26n, yolo26s), 10 trials × 30 epochs each,
+# OptunaSearch TPE with YOLO26 recipe warm-start.
 uv run python tune_hyperparameters.py
 
 # Subset of models with more trials and 1 GPU per trial
@@ -300,8 +315,8 @@ uv run python tune_hyperparameters.py \
     --epochs 50 \
     --gpu-per-trial 1
 
-# Single model, using Ultralytics' full default 28-parameter search space
-uv run python tune_hyperparameters.py --models yolo11n --default-space
+# Fall back to plain random search (no optuna dependency needed)
+uv run python tune_hyperparameters.py --search-algo random
 ```
 
 Key flags (see `--help` for the full list):
@@ -313,13 +328,40 @@ Key flags (see `--help` for the full list):
 | `--epochs` | `30` | Max epochs per trial (ASHA prunes bad trials early) |
 | `--grace-period` | `10` | ASHA grace period before pruning is allowed |
 | `--gpu-per-trial` | auto | Fractional GPUs per trial (e.g. `0.5` → 2 trials/GPU) |
-| `--default-space` | off | Swap in Ultralytics' full 28-parameter default space |
+| `--search-algo` | `optuna` | `optuna` (TPE + YOLO26 warm-start) or `random` |
 
-Internally the script calls `model.tune(use_ray=True, ...)` once per
-selected model. Ray Tune orchestrates an **ASHA scheduler**
-(`grace_period`, `reduction_factor=3`), and each model's best trial is
-written to `runs/tune/visdrone_raytune_<model>_best_hyperparameters.json`.
-A summary table of per-model mAP is printed at the end.
+Internally the script builds a `tune.Tuner` per model with:
+
+- `search_alg = OptunaSearch(metric="metrics/mAP50-95(B)", mode="max",
+  points_to_evaluate=<YOLO26 recipe for yolo26n/yolo26s, else None>)`
+- `scheduler = ASHAScheduler(max_t=epochs, grace_period=grace_period,
+  reduction_factor=3)`
+- `trainable = tune.with_parameters(_yolo_tune_trainable,
+  weights=..., base_kwargs=...)` with GPU resources auto-detected.
+
+Each model's best trial is written to
+`runs/tune/visdrone_raytune_<model>_best_hyperparameters.json` and a
+summary table of per-model mAP is printed at the end.
+
+### Why OptunaSearch (TPE)?
+
+With our constraint mix — small budget (10 trials/model), expensive
+GPU trials, ASHA-pruned, ~15-20 mixed continuous/integer parameters —
+TPE is the most practical Ray Tune search algorithm:
+
+- Handles `loguniform` / `uniform` / `randint` natively.
+- Builds a useful surrogate after ~5 trials, so even a tiny budget
+  learns from prior results instead of sampling uniformly.
+- Composes cleanly with `ASHAScheduler` (unlike BOHB / BlendSearch /
+  CFO, which bundle their own early-stopping and would conflict).
+- Supports `points_to_evaluate`, which is what enables the YOLO26
+  recipe warm-start.
+
+The alternatives (`HyperOptSearch`, `AxSearch` / BoTorch, `HEBOSearch`,
+`BayesOptSearch`) are all viable but either drop mixed-type support,
+add heavy dependencies, or offer marginal benefits at n ≤ 10 trials.
+Random search (`--search-algo random`) is retained as a dependency-
+free fallback.
 
 ### VisDrone hyperparameter audit
 

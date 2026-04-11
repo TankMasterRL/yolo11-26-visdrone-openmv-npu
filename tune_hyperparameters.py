@@ -1,30 +1,38 @@
 #!/usr/bin/env python3
 """
-Hyperparameter Tuning for YOLO on VisDrone with Ray Tune + TensorBoard
+Hyperparameter Tuning for YOLO on VisDrone with Ray Tune + Optuna
 ========================================================================
 
-Wraps Ultralytics' built-in ``model.tune(use_ray=True)`` integration
-(see https://docs.ultralytics.com/integrations/ray-tune/) with
-model-family-aware search spaces tuned for VisDrone small-object
-drone imagery:
+In-house Ray Tune driver that runs one **OptunaSearch** (TPE) sweep
+per model, with an ASHA scheduler for early stopping. The YOLO26
+sweeps are **warm-started** by seeding Optuna's
+``points_to_evaluate`` with the official YOLO26 training recipe
+(see https://docs.ultralytics.com/guides/yolo26-training-recipe/),
+so trial #0 is guaranteed to be the published baseline and the
+remaining budget refines around it.
 
-  * YOLO11n / YOLO11s → VisDrone-audited YOLO11 space.
-  * YOLO26n           → space bracketed around the official YOLO26n
-                        training recipe (DFL-heavy, aggressive scale).
-  * YOLO26s           → space bracketed around the official YOLO26s
-                        training recipe (box-heavy, gentle LR decay,
-                        no rotation / shear).
+Why we do NOT use ``model.tune(use_ray=True)``:
+    Ultralytics' built-in Ray Tune integration
+    (``ultralytics/utils/tuner.py::run_ray_tune``) hard-codes Ray's
+    default ``BasicVariantGenerator`` (random search) and does not
+    forward a ``search_alg`` argument. To use Optuna + recipe
+    warm-starting we therefore build the ``tune.Tuner`` ourselves and
+    call ``YOLO(weights).train(**config)`` from our own trainable.
 
-The YOLO26 spaces follow https://docs.ultralytics.com/guides/yolo26-training-recipe/
-because the nano and small recipes differ sharply — see
-``_visdrone_yolo26n_space`` and ``_visdrone_yolo26s_space`` below.
+Model-family-aware search spaces:
+    * YOLO11n / YOLO11s → VisDrone-audited YOLO11 space.
+    * YOLO26n           → space bracketed around the official YOLO26n
+                          training recipe (DFL-heavy, aggressive scale).
+    * YOLO26s           → space bracketed around the official YOLO26s
+                          training recipe (box-heavy, gentle LR decay,
+                          no rotation / shear).
 
-By default, runs an independent tuning sweep for **all four models**
-(YOLO11n, YOLO11s, YOLO26n, YOLO26s) — each gets its own Ray Tune
-experiment directory and best-hyperparameters JSON.
+    YOLO26 variants get distinct spaces because the nano and small
+    recipes differ sharply — see ``_visdrone_yolo26n_space`` and
+    ``_visdrone_yolo26s_space`` below.
 
-Ray Tune uses the ASHA scheduler by default – trials that underperform
-are stopped early, so ``--iterations`` can be set relatively high.
+Ray Tune uses the ASHA scheduler – trials that underperform are
+stopped early, so ``--iterations`` can be set relatively high.
 
 TensorBoard integration:
     Ultralytics writes per-trial TFEvent logs into each trial's
@@ -41,12 +49,16 @@ TensorBoard integration:
     The script prints the exact commands at the end of the run.
 
 Usage:
-    # Default: tune all 4 models, 10 trials each, 30 epochs, grace 10
+    # Default: tune all 4 models, 10 trials each, 30 epochs, grace 10,
+    # OptunaSearch TPE + YOLO26 recipe warm-start
     uv run python tune_hyperparameters.py
 
     # Subset of models, more trials, 1 GPU per trial
     uv run python tune_hyperparameters.py \\
         --models yolo11s yolo26s --iterations 30 --gpu-per-trial 1
+
+    # Fall back to plain random search (no Optuna dependency)
+    uv run python tune_hyperparameters.py --search-algo random
 
     # Use a different dataset
     uv run python tune_hyperparameters.py --data VisDrone.yaml --epochs 50
@@ -69,6 +81,12 @@ ALL_MODELS = {
     "yolo26n": "yolo26n.pt",
     "yolo26s": "yolo26s.pt",
 }
+
+# Metric both the ASHA scheduler and OptunaSearch optimise.
+# Must match the key Ultralytics reports in ``trainer.metrics`` after
+# each validation pass.
+_METRIC_NAME = "metrics/mAP50-95(B)"
+_METRIC_MODE = "max"
 
 
 def _visdrone_yolo11_space():
@@ -327,11 +345,120 @@ def parse_args() -> argparse.Namespace:
              "(default: visdrone_raytune)",
     )
     p.add_argument(
-        "--default-space", action="store_true",
-        help="Use Ultralytics' full default 28-parameter search space "
-             "instead of the VisDrone-/model-family-tuned one",
+        "--search-algo",
+        choices=["optuna", "random"],
+        default="optuna",
+        help="Ray Tune search algorithm. 'optuna' uses OptunaSearch "
+             "(TPE) with YOLO26 recipe warm-starting via "
+             "points_to_evaluate; 'random' uses Ray's default "
+             "BasicVariantGenerator. Default: optuna",
     )
     return p.parse_args()
+
+
+def _recipe_seed_for(model_key: str, space: dict) -> list[dict] | None:
+    """
+    Return the YOLO26 training recipe as an ``OptunaSearch``
+    ``points_to_evaluate`` seed, filtered to the keys that actually
+    exist in ``space``. Returns ``None`` for YOLO11 (no recipe warm
+    start) or if the recipe import fails.
+
+    This is what makes the YOLO26 sweeps *refine* the published recipe
+    rather than explore the space from scratch — trial #0 is always
+    the exact recipe configuration.
+    """
+    # Import lazily + defensively: train_and_export lives in the repo
+    # root next to this script, but Ray Tune workers may have a
+    # different cwd, so we also ensure our directory is on sys.path.
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        from train_and_export import MODEL_TRAIN_OVERRIDES
+    except Exception:
+        return None
+
+    recipe = MODEL_TRAIN_OVERRIDES.get(model_key)
+    if not recipe:
+        return None
+    seed = {k: v for k, v in recipe.items() if k in space}
+    return [seed] if seed else None
+
+
+def _yolo_tune_trainable(
+    config: dict,
+    *,
+    weights: str,
+    base_kwargs: dict,
+) -> None:
+    """
+    Ray Tune trainable: trains a YOLO model with a sampled
+    ``config`` and reports per-epoch validation metrics back to Ray
+    Tune so the ASHA scheduler can prune under-performing trials.
+
+    Must be defined at module level so Ray can pickle it when
+    dispatching to remote actors. Extra kwargs (``weights``,
+    ``base_kwargs``) are injected via ``tune.with_parameters`` in
+    ``tune_one_model``.
+    """
+    from ultralytics import YOLO
+    from ray import train as ray_train
+
+    # Namespace each trial's Ultralytics run directory by the Ray
+    # Tune trial ID so concurrent trials don't stomp on each other's
+    # project dir (important for fractional --gpu-per-trial).
+    try:
+        trial_id = ray_train.get_context().get_trial_id()
+    except Exception:
+        trial_id = None
+
+    train_kwargs = dict(base_kwargs)
+    train_kwargs.update(config)
+    if trial_id:
+        base_name = train_kwargs.get("name", "trial")
+        train_kwargs["name"] = f"{base_name}_{trial_id}"
+
+    model = YOLO(weights)
+
+    def _on_fit_epoch_end(trainer):
+        raw = getattr(trainer, "metrics", None) or {}
+        metrics: dict[str, float] = {}
+        for k, v in raw.items():
+            try:
+                metrics[k] = float(v)
+            except (TypeError, ValueError):
+                continue
+        metrics["epoch"] = int(getattr(trainer, "epoch", 0))
+        if metrics:
+            ray_train.report(metrics)
+
+    model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
+    model.train(**train_kwargs)
+
+
+def _make_run_config(name: str, output_dir: Path):
+    """
+    Build a Ray ``RunConfig`` that works across Ray 2.x versions
+    (the class moved from ``ray.tune`` to ``ray.train`` in 2.7+).
+    ``storage_path`` must be absolute for Ray.
+    """
+    storage = str(output_dir.resolve())
+    try:
+        from ray.train import RunConfig  # type: ignore
+    except ImportError:
+        from ray.tune import RunConfig  # type: ignore
+    return RunConfig(name=name, storage_path=storage)
+
+
+def _resolve_gpus_per_trial(gpu_per_trial_arg: float | None) -> float:
+    """Auto-detect GPU availability if ``--gpu-per-trial`` is not set."""
+    if gpu_per_trial_arg is not None:
+        return float(gpu_per_trial_arg)
+    try:
+        import torch
+        return 1.0 if torch.cuda.is_available() else 0.0
+    except Exception:
+        return 0.0
 
 
 def tune_one_model(
@@ -341,14 +468,72 @@ def tune_one_model(
     output_dir: Path,
 ) -> dict | None:
     """
-    Run a Ray Tune sweep for a single model.
+    Run an in-house Ray Tune sweep (OptunaSearch TPE + ASHA) for a
+    single model, warm-starting YOLO26 variants from the official
+    training recipe.
 
     Returns a summary dict (model, name, best metrics + cfg path) on
     success, or None if the sweep failed.
     """
-    from ultralytics import YOLO
+    from ray import tune
+    from ray.tune.schedulers import ASHAScheduler
 
     exp_name = f"{args.name_prefix}_{model_key}"
+    space = build_search_space(model_key)
+
+    # ---- Search algorithm ---------------------------------------------
+    search_alg = None
+    search_desc = "Random (BasicVariantGenerator)"
+    if args.search_algo == "optuna":
+        try:
+            from ray.tune.search.optuna import OptunaSearch
+        except ImportError:
+            print(
+                "ERROR: optuna is not installed; install it via\n"
+                "    uv sync --extra tune\n"
+                "or re-run with --search-algo random to use plain random search.",
+                file=sys.stderr,
+            )
+            return None
+        points_to_evaluate = _recipe_seed_for(model_key, space)
+        search_alg = OptunaSearch(
+            metric=_METRIC_NAME,
+            mode=_METRIC_MODE,
+            points_to_evaluate=points_to_evaluate,
+        )
+        if points_to_evaluate:
+            search_desc = (
+                f"OptunaSearch (TPE, seeded with YOLO26 recipe, "
+                f"{len(points_to_evaluate[0])} anchors)"
+            )
+        else:
+            search_desc = "OptunaSearch (TPE, cold start)"
+
+    # ---- Scheduler -----------------------------------------------------
+    # ASHA owns early stopping. max_t / grace_period are expressed in
+    # training_iteration units, which equal epochs thanks to our
+    # per-epoch `ray_train.report` in _yolo_tune_trainable.
+    scheduler = ASHAScheduler(
+        metric=_METRIC_NAME,
+        mode=_METRIC_MODE,
+        max_t=args.epochs,
+        grace_period=args.grace_period,
+        reduction_factor=3,
+    )
+
+    # ---- Resources -----------------------------------------------------
+    gpus_per_trial = _resolve_gpus_per_trial(args.gpu_per_trial)
+
+    # ---- Base Ultralytics train kwargs shared by all trials -----------
+    base_train_kwargs = dict(
+        data=args.data,
+        epochs=args.epochs,
+        imgsz=args.imgsz,
+        project=str(output_dir),
+        name=f"{exp_name}_trial",
+        exist_ok=True,
+        verbose=False,
+    )
 
     print("\n" + "=" * 72)
     print(f" [{model_key}]  Ray Tune sweep → {exp_name}")
@@ -357,37 +542,41 @@ def tune_one_model(
     print(f"  Iterations   : {args.iterations}")
     print(f"  Epochs/trial : {args.epochs} (grace={args.grace_period})")
     print(f"  Image size   : {args.imgsz}")
-    print(f"  GPU/trial    : {args.gpu_per_trial if args.gpu_per_trial else 'auto'}")
+    print(f"  GPU/trial    : {gpus_per_trial}")
+    print(f"  Search algo  : {search_desc}")
 
-    model = YOLO(weights)
-
-    tune_kwargs = dict(
-        data=args.data,
-        epochs=args.epochs,
-        imgsz=args.imgsz,
-        iterations=args.iterations,
-        grace_period=args.grace_period,
-        use_ray=True,
-        project=str(output_dir),
-        name=exp_name,
+    trainable = tune.with_parameters(
+        _yolo_tune_trainable,
+        weights=weights,
+        base_kwargs=base_train_kwargs,
     )
-    if args.gpu_per_trial is not None:
-        tune_kwargs["gpu_per_trial"] = args.gpu_per_trial
-    if not args.default_space:
-        tune_kwargs["space"] = build_search_space(model_key)
+    trainable = tune.with_resources(
+        trainable, {"cpu": 1, "gpu": gpus_per_trial}
+    )
+
+    tuner = tune.Tuner(
+        trainable,
+        param_space=space,
+        tune_config=tune.TuneConfig(
+            search_alg=search_alg,
+            scheduler=scheduler,
+            num_samples=args.iterations,
+        ),
+        run_config=_make_run_config(exp_name, output_dir),
+    )
 
     try:
-        result_grid = model.tune(**tune_kwargs)
+        result_grid = tuner.fit()
     except Exception as e:
         print(f"  ✗ Tuning failed for {model_key}: {e}")
         traceback.print_exc()
         return None
 
-    # --- Extract & persist best trial -----------------------------------
+    # ---- Extract & persist best trial ---------------------------------
     summary = {"model": model_key, "name": exp_name, "weights": weights}
     try:
         best_result = result_grid.get_best_result(
-            metric="metrics/mAP50-95(B)", mode="max"
+            metric=_METRIC_NAME, mode=_METRIC_MODE
         )
         best_cfg = best_result.config
         best_metrics = best_result.metrics or {}
@@ -396,7 +585,7 @@ def tune_one_model(
         for k, v in sorted(best_cfg.items()):
             print(f"    {k:20s} = {v}")
 
-        map5095 = best_metrics.get("metrics/mAP50-95(B)")
+        map5095 = best_metrics.get(_METRIC_NAME)
         map50 = best_metrics.get("metrics/mAP50(B)")
         if map5095 is not None:
             print(f"\n  mAP50-95 : {map5095:.4f}")
@@ -432,7 +621,7 @@ def main() -> None:
             "Install the tuning extras with:\n"
             "    uv sync --extra tune\n"
             "or directly with pip:\n"
-            "    pip install 'ray[tune]' tensorboard",
+            "    pip install 'ray[tune]' 'optuna>=3.4' tensorboard",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -450,7 +639,8 @@ def main() -> None:
     print(f"  Image size   : {args.imgsz}")
     print(f"  GPU/trial    : {args.gpu_per_trial if args.gpu_per_trial else 'auto'}")
     print(f"  Output       : {output_dir}")
-    print(f"  Search space : {'default (28 params)' if args.default_space else 'VisDrone + model-family tuned'}")
+    print(f"  Search algo  : {args.search_algo}")
+    print(f"  Search space : VisDrone + model-family tuned")
     print("=" * 72)
 
     # ------------------------------------------------------------------
