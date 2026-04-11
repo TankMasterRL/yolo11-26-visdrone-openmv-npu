@@ -16,9 +16,10 @@ dependencies = [
 ae3 = [
     "ethos-u-vela>=3.12.0",
 ]
-# Hyperparameter tuning with Ray Tune + TensorBoard visualisation
+# Hyperparameter tuning with Ray Tune + Optuna + TensorBoard visualisation
 tune = [
     "ray[tune]>=2.10.0",
+    "optuna>=3.4.0",
     "tensorboard>=2.15.0",
 ]
 # Full TFLite INT8 export dependency chain required by train_and_export.py
@@ -42,6 +43,7 @@ all = [
     "ultralytics>=8.3.0",
     "ethos-u-vela>=3.12.0",
     "ray[tune]>=2.10.0",
+    "optuna>=3.4.0",
     "tensorboard>=2.15.0",
     "tensorflow>=2.16.1",
     "tf_keras<=2.19.0",
