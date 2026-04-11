@@ -50,18 +50,34 @@ TensorBoard integration:
 
 Usage:
     # Default: tune all 4 models, 10 trials each, 30 epochs, grace 10,
-    # OptunaSearch TPE + YOLO26 recipe warm-start
+    # OptunaSearch TPE + YOLO26 recipe warm-start, AutoBatch on
     uv run python tune_hyperparameters.py
 
     # Subset of models, more trials, 1 GPU per trial
     uv run python tune_hyperparameters.py \\
         --models yolo11s yolo26s --iterations 30 --gpu-per-trial 1
 
+    # Push the GPU harder: 85% memory AutoBatch + RAM-cached dataset
+    uv run python tune_hyperparameters.py --batch 0.85 --cache ram
+
+    # Two trials per GPU – use a fractional batch so they coexist
+    uv run python tune_hyperparameters.py --gpu-per-trial 0.5 --batch 0.4
+
     # Fall back to plain random search (no Optuna dependency)
     uv run python tune_hyperparameters.py --search-algo random
 
     # Use a different dataset
     uv run python tune_hyperparameters.py --data VisDrone.yaml --epochs 50
+
+GPU performance knobs:
+    ``--batch``     int / -1 / 0<f<1   AutoBatch fraction or fixed
+    ``--cache``     ram | disk | none  Dataset cache mode (default: disk)
+    ``--workers``   int                Dataloader workers per trial
+    ``--gpu-per-trial``  float         Fractional GPU sharing for ASHA
+
+    See README §"GPU performance & autobatching" for the full
+    decision matrix and the OOM-avoidance rules when sharing one GPU
+    across multiple concurrent trials.
 """
 
 from __future__ import annotations
@@ -335,6 +351,35 @@ def parse_args() -> argparse.Namespace:
         "--imgsz", type=int, default=640,
         help="Training image size (default: 640)",
     )
+    # ---- GPU performance knobs (forwarded to every Ray Tune trial) --
+    # These are the most impactful runtime settings *outside* of the
+    # tuned hyperparameter space. Without them, every trial silently
+    # falls back to Ultralytics' defaults (batch=16, cache=False),
+    # leaving most of the GPU idle.
+    p.add_argument(
+        "--batch", default=-1,
+        help="Per-trial batch size: int N (fixed), -1 (AutoBatch ~60%% "
+             "GPU mem, default), or 0<f<1 (AutoBatch f%% GPU mem). "
+             "When --gpu-per-trial < 1.0, prefer a *fraction* like 0.4 so "
+             "two co-tenant trials don't both reach for 60%% and OOM.",
+    )
+    p.add_argument(
+        "--cache", choices=["ram", "disk", "none"], default="disk",
+        help="Per-trial dataset cache mode (default: disk). Ultralytics' "
+             "own default is 'none' which re-reads images every epoch — "
+             "use 'disk' or 'ram' for a 1.5-3x epoch speedup.",
+    )
+    p.add_argument(
+        "--workers", type=int, default=8,
+        help="Dataloader worker processes per trial (default: 8). "
+             "Lower this when running many concurrent trials per GPU "
+             "to avoid CPU/RAM contention.",
+    )
+    p.add_argument(
+        "--device", type=str, default=None,
+        help="CUDA device(s) per trial, e.g. '0' or 'cpu' "
+             "(default: auto-detect; Ray sets CUDA_VISIBLE_DEVICES per trial)",
+    )
     p.add_argument(
         "--output", default="runs/tune",
         help="Root directory for tuning results (default: runs/tune)",
@@ -353,7 +398,61 @@ def parse_args() -> argparse.Namespace:
              "points_to_evaluate; 'random' uses Ray's default "
              "BasicVariantGenerator. Default: optuna",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    # Reuse train_and_export.parse_batch so int / -1 / float-fraction
+    # all behave identically across the two scripts.
+    args.batch = _parse_batch_arg(args.batch)
+    return args
+
+
+def _parse_batch_arg(value):
+    """
+    Mirror of ``train_and_export.parse_batch`` so the tuning script can
+    accept the same int / -1 / 0<f<1 syntax for ``--batch`` without
+    a hard import dependency on the sibling module at argparse time.
+    """
+    if value is None or value == -1:
+        return -1
+    f = float(value)
+    if f == -1.0:
+        return -1
+    if 0.0 < f < 1.0:
+        return f
+    return int(f)
+
+
+def _enable_gpu_fast_path() -> None:
+    """
+    Flip on cuDNN benchmark + TF32 matmul before any Ray actor starts a
+    YOLO trainer. See ``train_and_export.enable_gpu_fast_path`` for the
+    full rationale; this is a local copy so the tuner does not have to
+    import the sibling module at startup (it does so lazily, on the
+    workers, via ``_recipe_seed_for``).
+    """
+    try:
+        import torch
+    except Exception:
+        return
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+    try:
+        name = torch.cuda.get_device_name(0)
+        free, total = torch.cuda.mem_get_info()
+        print(
+            f"  GPU fast path: {name}  "
+            f"({free / 1e9:.1f} / {total / 1e9:.1f} GB free) "
+            f"– cuDNN benchmark on, TF32 matmul on"
+        )
+    except Exception:
+        pass
 
 
 def _recipe_seed_for(model_key: str, space: dict) -> list[dict] | None:
@@ -584,16 +683,40 @@ def tune_one_model(
     # ---- Resources -----------------------------------------------------
     gpus_per_trial = _resolve_gpus_per_trial(args.gpu_per_trial)
 
+    # Safety net: if the user shares one GPU across multiple trials but
+    # also leaves --batch on AutoBatch (-1 → 60% GPU mem), each
+    # co-tenant trial will independently try to claim 60% and the
+    # second one will OOM at startup. Warn loudly and recommend a
+    # fractional batch instead. We do not silently override the user's
+    # value — they may be running on a beefy multi-GPU host and want -1.
+    if 0.0 < gpus_per_trial < 1.0 and args.batch == -1:
+        print(
+            f"  ⚠  --gpu-per-trial={gpus_per_trial} with --batch=-1 "
+            f"(AutoBatch 60%% mem): co-tenant trials may OOM. "
+            f"Consider --batch {round(0.5 * gpus_per_trial, 2)} "
+            f"or a fixed integer batch."
+        )
+
     # ---- Base Ultralytics train kwargs shared by all trials -----------
+    # GPU-utilisation knobs are forwarded into every trial here. Without
+    # them Ultralytics' built-in defaults (batch=16, cache=False) leave
+    # the GPU mostly idle during the search; this is the single biggest
+    # speedup for the tuning script.
     base_train_kwargs = dict(
         data=args.data,
         epochs=args.epochs,
         imgsz=args.imgsz,
+        batch=args.batch,
+        cache=False if args.cache == "none" else args.cache,
+        workers=args.workers,
+        amp=True,
         project=str(output_dir),
         name=f"{exp_name}_trial",
         exist_ok=True,
         verbose=False,
     )
+    if args.device is not None:
+        base_train_kwargs["device"] = args.device
 
     print("\n" + "=" * 72)
     print(f" [{model_key}]  Ray Tune sweep → {exp_name}")
@@ -603,6 +726,8 @@ def tune_one_model(
     print(f"  Epochs/trial : {args.epochs} (grace={args.grace_period})")
     print(f"  Image size   : {args.imgsz}")
     print(f"  GPU/trial    : {gpus_per_trial}")
+    print(f"  Batch        : {args.batch}")
+    print(f"  Cache / wkrs : {args.cache} / {args.workers}")
     print(f"  Search algo  : {search_desc}")
 
     trainable = tune.with_parameters(
@@ -689,6 +814,10 @@ def main() -> None:
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Flip cuDNN benchmark + TF32 on the *driver* process before any
+    # Ray worker is spawned. Workers inherit the env so this propagates.
+    _enable_gpu_fast_path()
+
     print("=" * 72)
     print(" Ray Tune × Ultralytics YOLO × VisDrone")
     print("=" * 72)
@@ -697,7 +826,10 @@ def main() -> None:
     print(f"  Iterations   : {args.iterations}  (per model)")
     print(f"  Epochs/trial : {args.epochs} (grace={args.grace_period})")
     print(f"  Image size   : {args.imgsz}")
+    print(f"  Batch        : {args.batch}")
+    print(f"  Cache / wkrs : {args.cache} / {args.workers}")
     print(f"  GPU/trial    : {args.gpu_per_trial if args.gpu_per_trial else 'auto'}")
+    print(f"  Device       : {args.device or 'auto'}")
     print(f"  Output       : {output_dir}")
     print(f"  Search algo  : {args.search_algo}")
     print(f"  Search space : VisDrone + model-family tuned")
