@@ -81,14 +81,25 @@ BOARDS = {
 # See the "Hyperparameter audit" section of the README for the rationale
 # behind each non-default choice and the cross-references to the Ultralytics
 # docs / community thread that motivates them.
+#
+# GPU-utilisation knobs (``batch`` / ``cache`` / ``workers``) are listed
+# here as the safe defaults but are also overridable from the CLI – see
+# the ``--batch`` / ``--cache`` / ``--workers`` / ``--device`` flags in
+# ``parse_args`` and the "GPU performance & autobatching" section of the
+# README for the trade-offs. ``batch=-1`` runs Ultralytics' AutoBatch
+# helper which sizes the batch to ~60% of free GPU memory; passing a
+# float in (0, 1) on the CLI (e.g. ``--batch 0.85``) targets that
+# fraction instead, which is the most reliable single-knob speedup on a
+# dedicated GPU.
 DEFAULT_TRAIN_ARGS = dict(
     data=VISDRONE_YAML,
     epochs=100,
     patience=20,
-    batch=-1,            # auto-batch
+    batch=-1,            # auto-batch (~60% GPU memory; CLI-overridable)
     imgsz=640,           # VisDrone benefits from larger input
     optimizer="auto",
     cos_lr=True,
+    amp=True,            # mixed precision – major GPU speedup, default on
     close_mosaic=10,
     # NOTE: ``multi_scale=True`` is intentionally **disabled**.
     # Ultralytics' multi-scale path calls
@@ -198,6 +209,75 @@ def which(tool: str) -> str | None:
     return shutil.which(tool)
 
 
+def parse_batch(value):
+    """
+    Parse a ``--batch`` argument supporting Ultralytics' three modes:
+
+      * ``-1``               → AutoBatch to ~60% of free GPU memory
+                               (Ultralytics' default safe target).
+      * ``0 < f < 1``        → AutoBatch to ``f`` * free GPU memory,
+                               e.g. ``0.85`` for 85% (more aggressive).
+      * positive integer N   → fixed batch size of N images.
+
+    Floats outside (0, 1) are coerced to int so e.g. ``--batch 32`` is
+    accepted as a fixed batch even when typed as ``32.0``.
+    """
+    if value is None:
+        return -1
+    f = float(value)
+    if f == -1.0:
+        return -1
+    if 0.0 < f < 1.0:
+        return f
+    return int(f)
+
+
+def enable_gpu_fast_path() -> None:
+    """
+    Enable cuDNN benchmark + TF32 matmul for maximum CUDA throughput.
+
+    Ultralytics already turns on AMP autocast (``amp=True``) and
+    pinned-memory dataloaders by default. The two extra knobs we toggle
+    here are the ones it does **not** flip:
+
+      * ``torch.backends.cudnn.benchmark = True`` — picks the fastest
+        cuDNN convolution algorithm per input shape. Worth ~5-15% on
+        fixed-resolution training (which we are, since ``multi_scale``
+        is disabled).
+      * ``torch.set_float32_matmul_precision("high")`` — enables TF32
+        matmuls on Ampere+ GPUs (A100, L4, T4-next, RTX 30xx/40xx),
+        ~20% faster than full FP32 with no measurable accuracy impact
+        at YOLO scale.
+
+    Both are no-ops on CPU and on GPUs that don't support them, so it
+    is safe to call unconditionally at the top of ``main``.
+    """
+    try:
+        import torch
+    except Exception:
+        return
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+    try:
+        name = torch.cuda.get_device_name(0)
+        free, total = torch.cuda.mem_get_info()
+        print(
+            f"  GPU fast path: {name}  "
+            f"({free / 1e9:.1f} / {total / 1e9:.1f} GB free) "
+            f"– cuDNN benchmark on, TF32 matmul on"
+        )
+    except Exception:
+        pass
+
+
 def run_cmd(cmd: list[str], cwd: str | None = None) -> int:
     """Run a subprocess, stream stdout/stderr, return exit code."""
     print(f"  → {' '.join(cmd)}")
@@ -215,6 +295,11 @@ def train_model(
     imgsz: int,
     epochs: int,
     project_dir: Path,
+    *,
+    batch=-1,
+    cache: str | bool = "disk",
+    workers: int = 8,
+    device: str | None = None,
 ) -> Path:
     """Train one YOLO model on VisDrone. Returns path to best.pt."""
     from ultralytics import YOLO
@@ -237,6 +322,19 @@ def train_model(
     train_args["epochs"] = epochs
     train_args["project"] = str(project_dir)
     train_args["name"] = model_name
+
+    # GPU-utilisation knobs (CLI-overridable). See ``parse_batch`` and
+    # ``enable_gpu_fast_path`` for the rationale.
+    train_args["batch"] = batch
+    train_args["cache"] = cache
+    train_args["workers"] = workers
+    if device is not None:
+        train_args["device"] = device
+
+    print(
+        f"  Runtime: batch={batch}  cache={cache}  workers={workers}  "
+        f"device={device or 'auto'}"
+    )
 
     model.train(**train_args)
 
@@ -409,6 +507,27 @@ def parse_args() -> argparse.Namespace:
         help="Export image size (default: 256 for nano, 320 for small)"
     )
     p.add_argument("--epochs", type=int, default=100, help="Training epochs")
+    # ---- GPU performance knobs --------------------------------------
+    p.add_argument(
+        "--batch", type=parse_batch, default=-1,
+        help="Batch size: int N (fixed), -1 (AutoBatch ~60%% GPU mem, "
+             "default), or 0<f<1 (AutoBatch f%% GPU mem, e.g. 0.85)",
+    )
+    p.add_argument(
+        "--cache", choices=["ram", "disk", "none"], default="disk",
+        help="Dataset cache mode (default: disk; 'ram' is fastest if "
+             "the dataset + augmentations fit in host RAM)",
+    )
+    p.add_argument(
+        "--workers", type=int, default=8,
+        help="Dataloader worker processes per GPU (default: 8; raise on "
+             "high-core hosts, lower on RAM-constrained Colab runtimes)",
+    )
+    p.add_argument(
+        "--device", type=str, default=None,
+        help="CUDA device(s) for training, e.g. '0', '0,1', or 'cpu' "
+             "(default: auto-detect; multi-GPU triggers DDP)",
+    )
     p.add_argument(
         "--skip-train", action="store_true",
         help="Skip training, only export from existing best.pt"
@@ -447,6 +566,12 @@ def main() -> None:
     print(f"  Project: {project_dir}")
     print(f"  Output : {output_root}")
 
+    # Flip on cuDNN benchmark + TF32 before any CUDA work happens.
+    enable_gpu_fast_path()
+
+    # Translate "none" sentinel into Ultralytics' False (cache disabled).
+    cache_arg: str | bool = False if args.cache == "none" else args.cache
+
     # Write labels once
     output_root.mkdir(parents=True, exist_ok=True)
     write_labels(output_root)
@@ -459,7 +584,11 @@ def main() -> None:
         best_pt = project_dir / model_name / "weights" / "best.pt"
         if not args.skip_train:
             best_pt = train_model(
-                model_name, pretrained, args.imgsz, args.epochs, project_dir
+                model_name, pretrained, args.imgsz, args.epochs, project_dir,
+                batch=args.batch,
+                cache=cache_arg,
+                workers=args.workers,
+                device=args.device,
             )
         else:
             if not best_pt.exists():
