@@ -442,24 +442,46 @@ def _make_run_config(name: str, output_dir: Path):
     (the class moved from ``ray.tune`` to ``ray.train`` in 2.7+).
     ``storage_path`` must be absolute for Ray.
 
-    We force ``verbose=1`` (an int) to side-step a Ray Tune bug
-    observed on the Ray 2.x build shipped with Google Colab:
-    ``RunConfig.verbose`` defaults to a *string* (read from an env
-    var like ``RAY_AIR_VERBOSITY``), and ``get_air_verbosity`` then
-    crashes inside ``ray/tune/experimental/output.py`` with::
+    Two competing Ray 2.x bugs we have to thread the needle between:
 
-        AttributeError: 'str' object has no attribute 'value'
+      1. **Older Ray 2.x** (e.g. the build Colab shipped before
+         March 2026): ``RunConfig.verbose`` defaults to a *string*
+         read from ``RAY_AIR_VERBOSITY``, and ``get_air_verbosity``
+         then crashes inside ``ray/tune/experimental/output.py``
+         with::
 
-    because it does ``verbose if isinstance(verbose, int) else
-    verbose.value`` and a bare string has no ``.value`` attribute.
-    Passing an explicit int bypasses the env-var path entirely.
+             AttributeError: 'str' object has no attribute 'value'
+
+         because it does ``verbose if isinstance(verbose, int)
+         else verbose.value``. Workaround: pass an explicit
+         ``verbose=1``.
+
+      2. **Newer Ray 2.x with the v2 Train API** (current Colab
+         build): ``ray.train.RunConfig`` resolves to
+         ``ray.train.v2.api.config.RunConfig``, which has *dropped*
+         the ``verbose`` parameter entirely and raises
+         ``DeprecationWarning`` from ``__post_init__`` if it's
+         passed. Workaround: do **not** pass ``verbose``.
+
+    The fix is to try the old workaround first and fall back on
+    rejection, so the same source works on both Ray builds shipped
+    with Google Colab without us having to detect the version.
     """
     storage = str(output_dir.resolve())
+
+    # Prefer ``ray.tune.RunConfig`` since we drive the sweep with
+    # ``ray.tune.Tuner``; fall back to ``ray.train.RunConfig`` if
+    # the tune namespace doesn't re-export it.
     try:
-        from ray.train import RunConfig  # type: ignore
-    except ImportError:
         from ray.tune import RunConfig  # type: ignore
-    return RunConfig(name=name, storage_path=storage, verbose=1)
+    except ImportError:
+        from ray.train import RunConfig  # type: ignore
+
+    try:
+        return RunConfig(name=name, storage_path=storage, verbose=1)
+    except (TypeError, DeprecationWarning):
+        # Newer v2 RunConfig: ``verbose`` is no longer accepted.
+        return RunConfig(name=name, storage_path=storage)
 
 
 def _resolve_gpus_per_trial(gpu_per_trial_arg: float | None) -> float:
