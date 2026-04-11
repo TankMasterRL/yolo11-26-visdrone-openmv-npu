@@ -400,17 +400,37 @@ def _yolo_tune_trainable(
     dispatching to remote actors. Extra kwargs (``weights``,
     ``base_kwargs``) are injected via ``tune.with_parameters`` in
     ``tune_one_model``.
+
+    Reporting API note:
+        We use ``ray.tune.report`` (the canonical Tune Function-API
+        reporter), **not** ``ray.train.report``. The Ray 2.x v2 Train
+        API explicitly deprecates ``ray.train.report`` when called
+        from a function passed to Ray Tune and raises
+        ``DeprecationWarning`` from the report wrapper:
+
+            DeprecationWarning: `ray.train.report` is deprecated when
+            running in a function passed to Ray Tune. Please use the
+            equivalent `ray.tune` API instead.
+
+        See https://github.com/ray-project/ray/issues/49454.
     """
     from ultralytics import YOLO
-    from ray import train as ray_train
+    from ray import tune as ray_tune
 
     # Namespace each trial's Ultralytics run directory by the Ray
     # Tune trial ID so concurrent trials don't stomp on each other's
-    # project dir (important for fractional --gpu-per-trial).
+    # project dir (important for fractional --gpu-per-trial). The
+    # context module moved between ``ray.tune`` and ``ray.train``
+    # across Ray versions, so try both before giving up.
+    trial_id = None
     try:
-        trial_id = ray_train.get_context().get_trial_id()
+        trial_id = ray_tune.get_context().get_trial_id()
     except Exception:
-        trial_id = None
+        try:
+            from ray import train as ray_train
+            trial_id = ray_train.get_context().get_trial_id()
+        except Exception:
+            trial_id = None
 
     train_kwargs = dict(base_kwargs)
     train_kwargs.update(config)
@@ -429,8 +449,14 @@ def _yolo_tune_trainable(
             except (TypeError, ValueError):
                 continue
         metrics["epoch"] = int(getattr(trainer, "epoch", 0))
-        if metrics:
-            ray_train.report(metrics)
+        if not metrics:
+            return
+        # Try the dict-style signature first (Ray ≳ 2.5), fall back
+        # to the legacy **kwargs signature on older Ray builds.
+        try:
+            ray_tune.report(metrics)
+        except TypeError:
+            ray_tune.report(**metrics)
 
     model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
     model.train(**train_kwargs)
