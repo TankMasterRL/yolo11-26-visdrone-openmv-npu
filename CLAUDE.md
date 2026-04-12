@@ -150,14 +150,20 @@ directly.
 
 - Develop on a `claude/<topic>-<suffix>` branch (e.g.
   `claude/gpu-utilization-speedup`).
-- Each branch is merged into `main` with `--no-ff` and an explanatory
-  merge commit. The history is intentionally non-linear so each
-  feature/fix is one mergeable unit.
+- Branches are **fast-forward merged** into `main`
+  (`git checkout main && git merge <branch>`). This keeps the history
+  linear and bisectable. If the branch is behind `main`, rebase it
+  first (`git rebase main`) rather than creating a merge commit.
+- **Pull requests are squash-merged.** When a PR lands via GitHub, all
+  commits on the branch are squashed into a single commit on `main`.
+  Write the PR title as if it were the final commit message (imperative,
+  concise) and use the PR body for detail.
 - Commit messages: imperative, single-line subject, optional body
   explaining *why*. No `Co-Authored-By: Claude` trailers, no Anthropic
   attribution lines — keep them clean.
 - **Never** push directly to `main` from a working branch — always
-  merge via the local `git checkout main && git merge --no-ff` flow.
+  merge via the local `git checkout main && git merge <branch>` flow
+  or open a pull request.
 
 ## Gotchas (read these before debugging)
 
@@ -209,4 +215,4 @@ directly.
   (bump `ultralytics>=...` in `pyproject.toml`) or the **PyTorch
   upsample decomposition** before suspecting our code.
 - Prefer small, focused branches. The git history shows the cadence:
-  one bug = one branch = one merge commit.
+  one bug = one branch = one commit on `main`.
