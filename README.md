@@ -362,24 +362,26 @@ export/
 
 ## 2b. Hyperparameter Tuning (Ray Tune + Optuna + TensorBoard)
 
-This project includes `tune_hyperparameters.py`, an in-house
-[Ray Tune](https://docs.ray.io/en/latest/tune/index.html) driver that
-runs one **OptunaSearch** (TPE) sweep per model with an ASHA scheduler
-for early stopping. YOLO26 sweeps are **warm-started** from the
-official [YOLO26 training recipe](https://docs.ultralytics.com/guides/yolo26-training-recipe/)
+This project includes `tune_hyperparameters.py`, a thin wrapper
+around Ultralytics' built-in
+[Ray Tune](https://docs.ray.io/en/latest/tune/index.html) integration
+(`model.tune(use_ray=True, ...)`) that runs one **OptunaSearch** (TPE)
+sweep per model with an ASHA scheduler for early stopping. YOLO26
+sweeps are **warm-started** from the official
+[YOLO26 training recipe](https://docs.ultralytics.com/guides/yolo26-training-recipe/)
 via `points_to_evaluate`, so the very first trial is guaranteed to
 reproduce the published baseline and the remaining budget refines
 around it.
 
-> **Why not `model.tune(use_ray=True)`?** Ultralytics' built-in
-> integration (`ultralytics/utils/tuner.py::run_ray_tune`) hard-codes
-> Ray's default `BasicVariantGenerator` (random search) and does
-> **not** forward a `search_alg` argument. To use Optuna + recipe
-> warm-starting we therefore build the `tune.Tuner` ourselves and call
-> `YOLO(weights).train(**config)` from our own trainable
-> (`_yolo_tune_trainable`). Metrics are reported back to Ray Tune
-> per epoch via an `on_fit_epoch_end` callback so ASHA can prune
-> under-performers.
+> **Requires Ultralytics ≥ 8.4.33.**
+> [PR ultralytics/ultralytics#23946](https://github.com/ultralytics/ultralytics/pull/23946)
+> added `search_alg` forwarding to `run_ray_tune`, which is what lets
+> us pass a pre-instantiated `OptunaSearch(points_to_evaluate=[...])`
+> straight through `model.tune(use_ray=True, search_alg=...)`. Earlier
+> releases hard-coded Ray's default `BasicVariantGenerator` (random
+> search), so this project used to ship a full in-house `tune.Tuner(...)`
+> driver as a workaround. That workaround has been removed —
+> `pyproject.toml` pins `ultralytics>=8.4.33` for this reason.
 
 ### Install tuning dependencies
 
@@ -421,25 +423,41 @@ Key flags (see `--help` for the full list):
 | `--device` | auto | CUDA device(s) per trial |
 | `--search-algo` | `optuna` | `optuna` (TPE + YOLO26 warm-start) or `random` |
 
-> **Speedup note.** Before this branch, `tune_hyperparameters.py` did
-> not forward `batch` / `cache` / `workers` into the trial trainable,
-> which meant every Ray Tune trial silently fell back to Ultralytics'
-> defaults (`batch=16`, `cache=False`) — small fixed batch, no caching,
-> ~30-50% GPU utilisation. The new defaults (`batch=-1`, `cache=disk`)
-> deliver a 2-3× wall-clock speedup per trial on a single GPU at no
-> accuracy cost. See the
+> **Speedup note.** `batch=-1` (AutoBatch) and `cache=disk` are the
+> project defaults for tuning, which deliver a 2-3× wall-clock
+> speedup per trial over the vanilla Ultralytics defaults
+> (`batch=16`, `cache=False`). The knobs are forwarded into every
+> Ray Tune trial via `model.tune(..., batch=..., cache=..., workers=...)`
+> — Ultralytics' `run_ray_tune` merges them into each trial's
+> `model.train(**config)` via `config.update(train_args)`. See the
 > [GPU performance & autobatching](#gpu-performance--autobatching)
 > section above for the rationale and the OOM-safety rules when
 > sharing one GPU across multiple concurrent trials.
 
-Internally the script builds a `tune.Tuner` per model with:
+Internally the script dispatches into Ultralytics' built-in Ray Tune
+integration per model:
 
-- `search_alg = OptunaSearch(metric="metrics/mAP50-95(B)", mode="max",
-  points_to_evaluate=<YOLO26 recipe for yolo26n/yolo26s, else None>)`
-- `scheduler = ASHAScheduler(max_t=epochs, grace_period=grace_period,
-  reduction_factor=3)`
-- `trainable = tune.with_parameters(_yolo_tune_trainable,
-  weights=..., base_kwargs=...)` with GPU resources auto-detected.
+```python
+YOLO(weights).tune(
+    use_ray=True,
+    space=build_search_space(model_key),          # VisDrone + family-tuned
+    search_alg=OptunaSearch(                      # pre-instantiated so we
+        metric="metrics/mAP50-95(B)", mode="max", # can attach the recipe
+        points_to_evaluate=<YOLO26 recipe for     # seed — Ultralytics'
+            yolo26n/yolo26s, else None>,          # string resolver does
+    ),                                            # not expose this.
+    iterations=args.iterations,
+    grace_period=args.grace_period,
+    gpu_per_trial=args.gpu_per_trial,
+    data=..., epochs=..., imgsz=..., batch=..., cache=..., workers=...,
+)
+```
+
+Ultralytics builds the `ASHAScheduler` (time_attr=epoch,
+metric=`metrics/mAP50-95(B)`, reduction_factor=3) internally and wires
+per-epoch metric reporting through its own training callback, so we
+do not need a custom trainable or a manual `tune.Tuner`. The returned
+`ResultGrid` is unpacked into a per-model summary.
 
 Each model's best trial is written to
 `runs/tune/visdrone_raytune_<model>_best_hyperparameters.json` and a

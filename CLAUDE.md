@@ -109,14 +109,19 @@ directly.
   the AE3/N6 NPU memory budgets — tune with `--imgsz-export`.
 
 ### `tune_hyperparameters.py`
-- Bypasses Ultralytics' built-in `model.tune(use_ray=True)` because
-  `ultralytics/utils/tuner.py::run_ray_tune` hard-codes the random
-  `BasicVariantGenerator` and does not forward a `search_alg`. We
-  build our own `tune.Tuner(trainable, ...)` to plug in `OptunaSearch`.
-- Trainable is a **module-level** function `_yolo_tune_trainable` (must
-  be picklable for Ray actor dispatch). It registers an Ultralytics
-  `on_fit_epoch_end` callback that forwards per-epoch metrics to Ray
-  Tune so ASHA can prune under-performers.
+- Drives Ultralytics' built-in `model.tune(use_ray=True, ...)`
+  integration. Ultralytics ≥ **8.4.33** (PR
+  ultralytics/ultralytics#23946) added `search_alg` forwarding to
+  `run_ray_tune`, which is what lets us plug in `OptunaSearch`; the
+  repo used to ship a full in-house `tune.Tuner(...)` driver as a
+  workaround for that missing forwarding — it has been removed.
+  **Do not reintroduce it.** `pyproject.toml` pins `ultralytics>=8.4.33`
+  for this reason.
+- Ultralytics internally builds the `ASHAScheduler` (time_attr=epoch,
+  metric=`metrics/mAP50-95(B)`, reduction_factor=3), constructs the
+  Ray `RunConfig`, and wires per-epoch metric reporting via its own
+  training callback. We only assemble the search space and search
+  algorithm on top.
 - **Search spaces** (`build_search_space`) dispatch by model family:
   YOLO11n/s share one space; `yolo26n` and `yolo26s` get distinct
   spaces bracketed around the recipe anchors.
@@ -124,10 +129,14 @@ directly.
   from `train_and_export.MODEL_TRAIN_OVERRIDES` as Optuna's
   `points_to_evaluate`, so trial #0 of every YOLO26 sweep is the
   published baseline and the rest of the budget refines around it.
-- The trainable forwards `batch` / `cache` / `workers` / `amp=True`
-  from `base_train_kwargs` so trials actually use the GPU. Without
-  this they silently fall back to Ultralytics' defaults
-  (`batch=16`, `cache=False`) and burn ~50% of available throughput.
+  This is why YOLO26 always gets a **pre-instantiated** `OptunaSearch`
+  rather than the string `"optuna"` — Ultralytics' string resolver
+  does not expose `points_to_evaluate`.
+- `batch` / `cache` / `workers` / `amp=True` flow through
+  `model.tune(..., **train_kwargs)` into each trial's
+  `model.train(**config)` via Ultralytics' `config.update(train_args)`.
+  Without those knobs trials silently fall back to the vanilla
+  `batch=16` / `cache=False` defaults and burn ~50% of throughput.
 
 ### `openmv-scripts/`
 - `region_counter.py` is a small MicroPython module — pure stdlib +
@@ -164,22 +173,16 @@ directly.
    tuning search space. Re-enable only when Colab ships a PyTorch
    with the upstream decomposition fix.
 
-2. **Ray 2.x version drift.** The Colab Ray build moves between v1
-   and v2 of the Train API roughly every release, and several
-   compatibility shims live in `tune_hyperparameters.py`:
-   - `_make_run_config` tries `ray.tune.RunConfig` first, falls back
-     to `ray.train.RunConfig`, and tries `verbose=1` first then drops
-     it on `(TypeError, DeprecationWarning)` — the older API needs
-     `verbose=1` to dodge a string-vs-int bug, the newer v2 API
-     rejects `verbose` entirely with a `DeprecationWarning`.
-   - `_yolo_tune_trainable` reports metrics via `ray.tune.report`
-     (not `ray.train.report` — the v2 Train API raises
-     `DeprecationWarning` on the latter inside Tune trainables) and
-     handles both dict-style and `**kwargs` signatures.
-   - Trial-id lookup tries `ray.tune.get_context()` first, falls back
-     to `ray.train.get_context()`.
-   - **Do not "simplify" any of these try/except blocks.** They exist
-     because the same source has to run on multiple Colab Ray builds.
+2. **Ray 2.x version drift lives in Ultralytics now.** The Colab Ray
+   build moves between v1 and v2 of the Train API roughly every
+   release (RunConfig `verbose` bugs, `ray.tune.report` vs
+   `ray.train.report` deprecations, `get_context` namespace shifts).
+   Our code used to carry a stack of `try/except` shims for those,
+   but since we now dispatch through `model.tune(use_ray=True, ...)`
+   those shims live inside Ultralytics' `run_ray_tune` — if Colab
+   ships a Ray version that breaks tuning, the fix is to bump
+   `ultralytics>=<next-version>` in `pyproject.toml`, not to
+   reintroduce a local driver.
 
 3. **AutoBatch + fractional GPU sharing OOMs.** `--batch -1` targets
    60% of free GPU memory. With `--gpu-per-trial 0.5`, two co-tenant
@@ -187,17 +190,12 @@ directly.
    safe rule is `--batch ≤ 0.5 × --gpu-per-trial`. The tuner already
    warns at trial-launch time but does not silently override.
 
-4. **Tuning trial naming.** `_yolo_tune_trainable` namespaces each
-   trial's Ultralytics run directory by the Ray trial ID
-   (`name=f"{base_name}_{trial_id}"`) so concurrent trials don't
-   stomp on each other's project dir. Don't remove this.
-
-5. **Python 3.14.** The `.python-version` is intentional. Some older
+4. **Python 3.14.** The `.python-version` is intentional. Some older
    wheels (notably parts of the TFLite export chain) may not yet ship
    3.14 builds — if you hit a wheel-not-found error in CI, the fix is
    to wait for the upstream wheel, not to downgrade Python.
 
-6. **`runs/`, `export/`, `*.pt`, `*.tflite`, `*.onnx` are gitignored.**
+5. **`runs/`, `export/`, `*.pt`, `*.tflite`, `*.onnx` are gitignored.**
    Don't commit training artefacts or weights.
 
 ## When in doubt
@@ -207,7 +205,8 @@ directly.
   to its sections by anchor instead (e.g. "see README §GPU performance
   & autobatching").
 - If a Colab error trace lands in your lap with no obvious local
-  cause, suspect **Ray version drift** or the **PyTorch upsample
-  decomposition** before suspecting our code.
+  cause, suspect **Ray version drift inside Ultralytics**
+  (bump `ultralytics>=...` in `pyproject.toml`) or the **PyTorch
+  upsample decomposition** before suspecting our code.
 - Prefer small, focused branches. The git history shows the cadence:
   one bug = one branch = one merge commit.
