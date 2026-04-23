@@ -28,10 +28,16 @@
 # `shm_size` are required for PyTorch DataLoader workers. GPU access is
 # declared via the portable Compose `deploy.resources` syntax which works
 # with NVIDIA Container Toolkit out of the box.
+#
+# NOTE: the `build:` block intentionally lives on ONE service (`train`)
+# only — see the comment above it. Compose v2 builds every service with
+# a `build:` block via buildx bake in parallel, and when multiple bake
+# targets export to the same `image:` tag they race on the final
+# "naming to …" step, failing with `image "…": already exists`. Declaring
+# the build once and having the other services reference the resulting
+# image tag avoids the race while keeping all five services on the same
+# image.
 x-gpu-service: &gpu-service
-  build:
-    context: .
-    dockerfile: docker/Dockerfile
   image: yolo11-26-visdrone-openmv:gpu
   ipc: host
   shm_size: "8gb"
@@ -71,6 +77,14 @@ services:
   # ----------------------------------------------------------------------
   train:
     <<: *gpu-service
+    # Canonical builder for the shared `yolo11-26-visdrone-openmv:gpu`
+    # image. All other services reuse this tag via `image:` only — see
+    # the note on `x-gpu-service` above. `docker compose build` (no
+    # args) therefore runs a single build, and `docker compose build
+    # train` is the explicit form.
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
     container_name: yolo-visdrone-train
     command: ["python", "train_and_export.py"]
 
