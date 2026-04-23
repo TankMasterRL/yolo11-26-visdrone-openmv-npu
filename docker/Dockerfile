@@ -60,19 +60,29 @@
 #
 ARG ULTRALYTICS_TAG=8.4.41
 ARG ULTRALYTICS_DIGEST=sha256:8b4551009fe170cf81d72995047be132df8b91380c225f37217cdd0d4ffd4dab
+ARG UV_TAG=0.11.7
+
+# ---------------------------------------------------------------------------
+# Alias the official uv distroless image as a named build stage. Global
+# ARGs are guaranteed to expand in FROM instructions, whereas BuildKit's
+# reference parser for `COPY --from=<external-image>:${ARG}` treats the
+# ${...} literally ("invalid reference format"). Going through a stage
+# alias is the portable workaround.
+# ---------------------------------------------------------------------------
+FROM ghcr.io/astral-sh/uv:${UV_TAG} AS uv
+
 FROM ultralytics/ultralytics:${ULTRALYTICS_TAG}@${ULTRALYTICS_DIGEST}
 
 LABEL org.opencontainers.image.source="https://github.com/TankMasterRL/yolo11-26-visdrone-openmv-npu"
 LABEL org.opencontainers.image.description="YOLO11/YOLO26 × VisDrone × OpenMV NPU — GPU train/tune/export image"
 
 # ---------------------------------------------------------------------------
-# Install uv (fast Python package / project manager) from the official
-# distroless image, pinned to a specific release. This is the same
-# binary used by the host-side `uv sync` workflow, so containerised and
-# local dependency resolution stay byte-for-byte compatible.
+# Install uv (fast Python package / project manager) from the aliased
+# stage above. This is the same binary used by the host-side `uv sync`
+# workflow, so containerised and local dependency resolution stay
+# byte-for-byte compatible.
 # ---------------------------------------------------------------------------
-ARG UV_TAG=0.11.7
-COPY --from=ghcr.io/astral-sh/uv:${UV_TAG} /uv /uvx /bin/
+COPY --from=uv /uv /uvx /bin/
 
 # ---------------------------------------------------------------------------
 # Install project extras via uv using pyproject.toml as the single
