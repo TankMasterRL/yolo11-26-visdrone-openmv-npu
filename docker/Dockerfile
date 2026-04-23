@@ -22,30 +22,68 @@
 # must be downloaded from ST — bind-mount it into /opt/stedgeai at
 # runtime (see docker-compose.yml and the README "Docker" section).
 #
+# ---------------------------------------------------------------------------
+# Reproducibility contract
+# ---------------------------------------------------------------------------
+# The build is pinned on three axes so that re-building the image on a
+# different day or a different host yields the same installed software:
+#
+#   1. Base image — pinned to a specific Ultralytics tag AND digest. The
+#      digest is authoritative; the tag is a human-readable label that
+#      must match the digest or the pull fails.
+#   2. uv binary  — pinned to a specific release tag of the official
+#      ghcr.io/astral-sh/uv distroless image.
+#   3. PyPI snapshot — `uv pip install --exclude-newer=<UTC date>` caps
+#      dependency resolution to packages published on or before that
+#      date, so `>=`-style constraints in pyproject.toml no longer drift
+#      as new upstream releases land.
+#
+# All three are exposed as build ARGs and can be overridden, e.g. to
+# refresh the snapshot:
+#
+#     docker build \
+#         --build-arg ULTRALYTICS_TAG=8.4.42 \
+#         --build-arg ULTRALYTICS_DIGEST=sha256:<new-digest> \
+#         --build-arg UV_TAG=0.11.8 \
+#         --build-arg UV_EXCLUDE_NEWER=2026-05-01 \
+#         -f docker/Dockerfile -t yolo11-26-visdrone-openmv:gpu .
+#
+# When bumping defaults, update all three together so the pinned state
+# stays internally consistent.
+#
 # References:
 #   - https://docs.ultralytics.com/guides/docker-quickstart/
 #   - https://docs.ultralytics.com/integrations/tflite/
 #   - https://docs.ultralytics.com/integrations/ray-tune/
 #   - https://docs.astral.sh/uv/guides/integration/docker/
+#   - https://docs.astral.sh/uv/reference/cli/#uv-pip-install  (--exclude-newer)
 #
-FROM ultralytics/ultralytics:latest
+ARG ULTRALYTICS_TAG=8.4.41
+ARG ULTRALYTICS_DIGEST=sha256:8b4551009fe170cf81d72995047be132df8b91380c225f37217cdd0d4ffd4dab
+FROM ultralytics/ultralytics:${ULTRALYTICS_TAG}@${ULTRALYTICS_DIGEST}
 
 LABEL org.opencontainers.image.source="https://github.com/TankMasterRL/yolo11-26-visdrone-openmv-npu"
 LABEL org.opencontainers.image.description="YOLO11/YOLO26 × VisDrone × OpenMV NPU — GPU train/tune/export image"
 
 # ---------------------------------------------------------------------------
 # Install uv (fast Python package / project manager) from the official
-# distroless image. This is the same binary used by the host-side
-# `uv sync` workflow, so containerised and local dependency resolution
-# stay byte-for-byte compatible.
+# distroless image, pinned to a specific release. This is the same
+# binary used by the host-side `uv sync` workflow, so containerised and
+# local dependency resolution stay byte-for-byte compatible.
 # ---------------------------------------------------------------------------
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+ARG UV_TAG=0.11.7
+COPY --from=ghcr.io/astral-sh/uv:${UV_TAG} /uv /uvx /bin/
 
 # ---------------------------------------------------------------------------
 # Install project extras via uv using pyproject.toml as the single
 # source of truth. We install --system rather than letting uv create a
 # .venv so the Ultralytics base image's pre-installed, GPU-linked
 # torch/CUDA build is preserved and our extras are layered on top.
+#
+# `--exclude-newer` caps dependency resolution at a fixed UTC date so
+# `>=`-style constraints in pyproject.toml don't silently drift when
+# new upstream releases are published — rebuilding tomorrow with the
+# same ARGs resolves to the same versions as today.
 #
 # UV_LINK_MODE=copy is required because /tmp and /usr/local are on
 # different mounts in some CI builders — symlinking would fail.
@@ -55,8 +93,12 @@ ENV UV_LINK_MODE=copy \
     UV_NO_CACHE=1 \
     UV_SYSTEM_PYTHON=1
 
+ARG UV_EXCLUDE_NEWER=2026-04-23
+ENV UV_EXCLUDE_NEWER=${UV_EXCLUDE_NEWER}
+
 COPY pyproject.toml /tmp/pyproject.toml
 RUN uv pip install --system --no-cache \
+        --exclude-newer "${UV_EXCLUDE_NEWER}" \
         -r /tmp/pyproject.toml --extra all \
     && rm -f /tmp/pyproject.toml
 
