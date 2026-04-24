@@ -174,10 +174,14 @@ declines them.
 1. **Branch.** Start from an up-to-date `main`
    (`git checkout main && git pull origin main`), then create the
    `claude/<topic>-<suffix>` branch the task specifies.
-2. **Implement + commit.** Keep changes focused. Run `bun run check`
-   and `bun run test` (plus `bun run test:e2e` if UI/API surface
-   changed) locally before committing. Use the commit-message
-   conventions above, including the `Assisted-by:` trailer.
+2. **Implement + commit.** Keep changes focused. Before committing,
+   run the repo's validation: `python -c "import ast;
+   ast.parse(open('<changed_file>').read())"` syntax-checks on any
+   edited Python files, plus `uv run python train_and_export.py --help`
+   and `uv run python tune_hyperparameters.py --help` smoke tests when
+   either CLI's surface changed. There is no test suite, linter, or
+   formatter — don't fabricate one. Use the commit-message conventions
+   above, including the `Assisted-by:` trailer.
 3. **Push.** `git push -u origin <branch>`. Retry with exponential
    backoff on network failures only.
 4. **Open the PR only when asked.** Use a short imperative title and
@@ -249,5 +253,9 @@ declines them.
   is for agents**. Don't duplicate the README into CLAUDE.md — link
   to its sections by anchor instead (e.g. "see README §GPU performance
   & autobatching").
+- If a Colab error trace lands in your lap with no obvious local
+  cause, suspect **Ray version drift inside Ultralytics**
+  (bump `ultralytics>=...` in `pyproject.toml`) or the **PyTorch
+  upsample decomposition** before suspecting our code.
 - Prefer small, focused branches. The git history shows the cadence:
   one bug = one branch = one commit on `main`.
