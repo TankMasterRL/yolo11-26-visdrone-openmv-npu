@@ -159,11 +159,54 @@ directly.
   Write the PR title as if it were the final commit message (imperative,
   concise) and use the PR body for detail.
 - Commit messages: imperative, single-line subject, optional body
-  explaining *why*. No `Co-Authored-By: Claude` trailers, no Anthropic
-  attribution lines — keep them clean.
+  explaining *why*. The human submitter is responsible for reviewing all AI-generated code, compliance, and taking responsibility for the contribution. Only humans can use "Signed-off", and the AI tools must be reported with the "Assisted-by" tag. e.g: Assisted-by: Claude:claude-3-opus coccinelle sparse
+  Don't include any references to session links from agentic coding tools, e.g. https://claude.ai/code/
 - **Never** push directly to `main` from a working branch — always
   merge via the local `git checkout main && git merge <branch>` flow
   or open a pull request.
+
+## PR workflow
+
+These are the actions to perform when shepherding a PR end-to-end.
+Follow them in order; skip steps only when the user explicitly
+declines them.
+
+1. **Branch.** Start from an up-to-date `main`
+   (`git checkout main && git pull origin main`), then create the
+   `claude/<topic>-<suffix>` branch the task specifies.
+2. **Implement + commit.** Keep changes focused. Before committing,
+   run the repo's validation: `python -c "import ast;
+   ast.parse(open('<changed_file>').read())"` syntax-checks on any
+   edited Python files, plus `uv run python train_and_export.py --help`
+   and `uv run python tune_hyperparameters.py --help` smoke tests when
+   either CLI's surface changed. There is no test suite, linter, or
+   formatter — don't fabricate one. Use the commit-message conventions
+   above, including the `Assisted-by:` trailer.
+3. **Push.** `git push -u origin <branch>`. Retry with exponential
+   backoff on network failures only.
+4. **Open the PR only when asked.** Use a short imperative title and
+   a body with a `## Summary` section and a `## Test plan` checklist.
+   The checklist should enumerate what *must* be true for the change
+   to ship (green CI, manual verification steps, cache/artefact paths,
+   etc.).
+5. **Subscribe to PR activity automatically** via
+   `subscribe_pr_activity` immediately after the PR is opened — don't
+   wait for the user to ask. Investigate CI failures and review
+   comments; make small fixes directly, ask the user when ambiguous.
+   The PR-merged webhook unsubscribes on its own.
+6. **Keep the test plan up to date.** As CI runs land and manual
+   checks complete, tick the corresponding boxes by editing the PR
+   body via `update_pull_request`. Annotate ticked items with the
+   commit SHA and the CI duration (e.g. "green on `abc1234` in 2m44s").
+   Mark items that aren't exercised in this PR as unticked with a
+   short reason, rather than deleting them.
+7. **Merge only on explicit request.** PRs are squash-merged via
+   `merge_pull_request` with `merge_method: squash`. Write the squash
+   commit title as the final imperative subject; put the body detail
+   in the squash commit message. The `Assisted-by:` trailer must
+   appear in the squash message.
+8. **Clean up.** Delete any local worktree branches that are no
+   longer needed after the squash-merge lands.
 
 ## Gotchas (read these before debugging)
 
