@@ -12,52 +12,52 @@ dependencies = [
     # (PR ultralytics/ultralytics#23946) which is what lets us drive
     # ``model.tune(use_ray=True, search_alg=OptunaSearch(...))`` from
     # ``tune_hyperparameters.py`` without a custom ``tune.Tuner`` wrapper.
-    "ultralytics>=8.4.33",
+    "ultralytics>=8.4.41",
 ]
 
 [project.optional-dependencies]
 # Arm Vela compiler for OpenMV AE3 (Ethos-U55 NPU)
 ae3 = [
-    "ethos-u-vela>=3.12.0",
+    "ethos-u-vela>=5.0.0",
 ]
 # Hyperparameter tuning with Ray Tune + Optuna + TensorBoard visualisation
 tune = [
-    "ray[tune]>=2.10.0",
-    "optuna>=3.4.0",
-    "tensorboard>=2.15.0",
+    "ray[tune]>=2.40.0",
+    "optuna>=4.0.0",
+    "tensorboard>=2.19.0",
 ]
 # Full TFLite INT8 export dependency chain required by train_and_export.py
 # (Ultralytics would lazy-install these, but pinning keeps builds
 # reproducible and aligns with the Docker image).
 # See https://docs.ultralytics.com/integrations/tflite/
 export = [
-    "tensorflow>=2.16.1",
-    "tf_keras<=2.19.0",
-    "onnx>=1.12.0,<2.0.0",
-    "onnx2tf>=1.26.3,<1.29.0",
-    "onnxslim>=0.1.71",
+    "tensorflow>=2.19.0",
+    "tf_keras<=2.21.0",
+    "onnx>=1.16.0,<2.0.0",
+    "onnx2tf>=2.0.0,<3.0.0",
+    "onnxslim>=0.1.91",
     "onnxruntime",
-    "sng4onnx>=1.0.1",
-    "onnx_graphsurgeon>=0.3.26",
-    "ai-edge-litert>=1.2.0",
+    "sng4onnx>=2.0.0",
+    "onnx_graphsurgeon>=0.5.0",
+    "ai-edge-litert>=2.0.0",
     "protobuf>=5",
 ]
 # Convenience group for everything installable via pip
 all = [
-    "ultralytics>=8.4.33",
-    "ethos-u-vela>=3.12.0",
-    "ray[tune]>=2.10.0",
-    "optuna>=3.4.0",
-    "tensorboard>=2.15.0",
-    "tensorflow>=2.16.1",
-    "tf_keras<=2.19.0",
-    "onnx>=1.12.0,<2.0.0",
-    "onnx2tf>=1.26.3,<1.29.0",
-    "onnxslim>=0.1.71",
+    "ultralytics>=8.4.41",
+    "ethos-u-vela>=5.0.0",
+    "ray[tune]>=2.40.0",
+    "optuna>=4.0.0",
+    "tensorboard>=2.19.0",
+    "tensorflow>=2.19.0",
+    "tf_keras<=2.21.0",
+    "onnx>=1.16.0,<2.0.0",
+    "onnx2tf>=2.0.0,<3.0.0",
+    "onnxslim>=0.1.91",
     "onnxruntime",
-    "sng4onnx>=1.0.1",
-    "onnx_graphsurgeon>=0.3.26",
-    "ai-edge-litert>=1.2.0",
+    "sng4onnx>=2.0.0",
+    "onnx_graphsurgeon>=0.5.0",
+    "ai-edge-litert>=2.0.0",
     "protobuf>=5",
 ]
 
