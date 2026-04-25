@@ -14,9 +14,12 @@ region-based object counting on both the **OpenMV AE3** and **OpenMV N6**.
 .
 ├── train_and_export.py              # Training + export + NPU compilation
 ├── tune_hyperparameters.py          # Ray Tune hyperparameter search + TensorBoard
+├── pyproject.toml                   # Single source of truth for deps + extras
 ├── docker/
 │   └── Dockerfile                   # GPU image extending ultralytics/ultralytics
-├── docker-compose.yml               # Train / tune / tensorboard / shell services
+├── docker-compose.yml               # Train / tune / export / tensorboard / shell services
+├── notebooks/
+│   └── visdrone_pipeline.ipynb      # End-to-end Colab / Paperspace / Kaggle notebook
 ├── openmv-scripts/
 │   ├── region_counter.py            # Shared counting module (upload to all boards)
 │   ├── ae3/                         # Scripts for OpenMV AE3
@@ -29,6 +32,7 @@ region-based object counting on both the **OpenMV AE3** and **OpenMV N6**.
 │   │   ├── main_yolo11s.py
 │   │   ├── main_yolo26n.py
 │   │   └── main_yolo26s.py
+├── CLAUDE.md                        # Guidance for Claude Code / LLM agents
 └── README.md                        # This file
 ```
 
@@ -203,6 +207,52 @@ the plain INT8 TFLite that the N6 firmware can load directly.
 All GPU services run with `ipc: host`, `shm_size: 8gb`, and
 `deploy.resources.reservations.devices: nvidia` so PyTorch DataLoader
 workers and multi-GPU training work correctly.
+
+The five Compose services (`train`, `tune`, `export`, `tensorboard`,
+`shell`) all share a single image tag (`yolo11-26-visdrone-openmv:gpu`).
+Only the `train` service carries a `build:` block; the others reference
+the same tag via `image:` to avoid the buildx-bake race that occurs
+when multiple targets export to the same tag in parallel. As a result
+`docker compose build` (no args) performs a single, deterministic build.
+
+**Reproducible rebuilds.** The Dockerfile pins three things so a
+rebuild on a different day or host yields the same installed software:
+
+| Build ARG | Default | What it pins |
+|---|---|---|
+| `ULTRALYTICS_TAG` + `ULTRALYTICS_DIGEST` | `8.4.41` + sha256 | Base image — tag is the human-readable label, digest is authoritative |
+| `UV_TAG` | `0.11.7` | The `uv` binary copied from `ghcr.io/astral-sh/uv` |
+| `UV_EXCLUDE_NEWER` | `2026-04-23` | PyPI snapshot cutoff — `uv pip install --exclude-newer=<date>` caps resolution to releases on or before that date so `>=`-style constraints in `pyproject.toml` don't drift |
+
+To refresh the snapshot, override all three together:
+
+```bash
+docker compose build \
+    --build-arg ULTRALYTICS_TAG=8.4.42 \
+    --build-arg ULTRALYTICS_DIGEST=sha256:<new-digest> \
+    --build-arg UV_TAG=0.11.8 \
+    --build-arg UV_EXCLUDE_NEWER=2026-05-01
+```
+
+### Cloud notebooks (Colab / Paperspace / Kaggle)
+
+`notebooks/visdrone_pipeline.ipynb` is an end-to-end notebook that runs
+the full **tune → train → export** pipeline in a single place. It
+auto-detects the runtime (Google Colab, Paperspace Gradient, Kaggle, or
+local Jupyter), clones the repo if needed, installs deps from
+`pyproject.toml` via `uv pip install --system`, and writes outputs to
+the appropriate persistent storage location for that environment.
+
+The defaults (one small model, ~10 epochs, a few iterations) complete
+in well under an hour on a free Colab / Paperspace GPU; scale up by
+editing the **Configuration** cell once the pipeline works.
+
+> **Python version note.** The project pins `requires-python = ">=3.14"`,
+> but the cloud install path intentionally bypasses that pin and
+> installs the dep list into the kernel's existing Python (3.11 / 3.12)
+> via `uv pip install --system`. Several ML deps (`tensorflow`,
+> `onnxruntime`, `ai-edge-litert`, ...) don't yet ship Python 3.14
+> wheels, so `uv sync --python 3.14` would fail on Colab/Paperspace.
 
 ---
 
