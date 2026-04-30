@@ -696,7 +696,7 @@ drop them into `docker/oak/extra_packages/` (gitignored):
 
 | Target | File | Source |
 | ------ | ---- | ------ |
-| RVC2 (OAK)   | `openvino-2022.3.0.tar.gz` (Linux x86_64 **dev** archive) | <https://storage.openvinotoolkit.org/repositories/openvino/packages/2022.3/linux/> |
+| RVC2 (OAK)   | `openvino-2022.3.0.tar.gz` (Linux x86_64 **dev** archive from the 2022.3.2 patch release; keep the `2022.3.0` filename so the upstream Dockerfile's hard-coded conditionals fire) | <https://storage.openvinotoolkit.org/repositories/openvino/packages/2022.3.2/linux/> |
 | RVC4 (OAK4)  | `snpe-2.32.6.zip` (Linux x86_64 SDK)                      | <https://softwarecenter.qualcomm.com/catalog/item/Qualcomm_AI_Runtime_Community> |
 
 > **Host architecture.** Both Luxonis Dockerfiles hard-code x86_64

@@ -13,24 +13,38 @@ filenames below) for the corresponding image to build. They are
 > `--platform linux/amd64` so Docker emulates via QEMU. See the host
 > architecture note in the top-level README.
 
-## RVC2 / OAK — OpenVINO 2022.3.0 dev archive
+## RVC2 / OAK — OpenVINO 2022.3.2 dev archive
 
-**File expected:** `openvino-2022.3.0.tar.gz`
+**File expected:** `openvino-2022.3.0.tar.gz` (note: the filename keeps
+the `2022.3.0` version string — see the explanation below).
 
-Download the **Linux x86_64 dev archive** (NOT the runtime build, NOT
+Download the **Linux x86_64 dev archive** from the 2022.3.2 patch
+release of the OpenVINO 2022.3 LTS line (NOT the runtime build, NOT
 the Windows or macOS builds, NOT a non-Ubuntu Linux build):
 
-<https://storage.openvinotoolkit.org/repositories/openvino/packages/2022.3/linux/>
+<https://storage.openvinotoolkit.org/repositories/openvino/packages/2022.3.2/linux/>
 
-Pick `l_openvino_toolkit_dev_ubuntu20_p_2022.3.0.<build>.tgz` (the
-filename includes a build suffix like `.9052`). Then rename:
+Pick `l_openvino_toolkit_dev_ubuntu20_p_2022.3.2.<build>.tgz` (the
+filename includes a build suffix). Then rename:
 
 ```bash
-mv l_openvino_toolkit_dev_ubuntu20_p_2022.3.0.*.tgz openvino-2022.3.0.tar.gz
+mv l_openvino_toolkit_dev_ubuntu20_p_2022.3.2.*.tgz openvino-2022.3.0.tar.gz
 ```
 
 (`.tgz` and `.tar.gz` are the same gzip-compressed tar — only the
 extension matters; the upstream Dockerfile expects `.tar.gz`.)
+
+> **Why `2022.3.0` in the filename when the archive is 2022.3.2?**
+> The upstream `luxonis/modelconverter` Dockerfile hard-codes three
+> branches that only fire when `VERSION=2022.3.0` (archive
+> strip-components count, redundant-tools cleanup path, model-optimizer
+> patch selection — see `docker/rvc2/Dockerfile` upstream). Any other
+> string drops into the `2021.4.0` legacy branch and fails. Because
+> 2022.3.2 is a drop-in patch release of the same 2022.3 LTS line —
+> identical archive layout, identical `/opt/intel/...` paths — staging
+> the 2022.3.2 archive under the `2022.3.0` filename gives you the
+> newer binaries with the build steps that work. `OPENVINO_VERSION` in
+> `docker/oak/build.sh` therefore stays at `2022.3.0`.
 
 The dev archive ships `mo` (Model Optimizer) and `compile_tool`, both
 of which the RVC2 converter invokes. The runtime archive lacks them
