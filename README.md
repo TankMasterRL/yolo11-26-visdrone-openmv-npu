@@ -401,11 +401,18 @@ export/
 │   │   ├── yolo11n_int8_vela.tflite
 │   │   └── yolo11n_int8.tflite    # fallback
 │   └── ...
-└── n6/                            # STEdgeAI output for N6
-    ├── yolo11n/
-    │   ├── st_ai_output/          # Neural-ART binary + headers
-    │   └── yolo11n_int8.tflite    # direct-load fallback
-    └── ...
+├── n6/                            # STEdgeAI output for N6
+│   ├── yolo11n/
+│   │   ├── st_ai_output/          # Neural-ART binary + headers
+│   │   └── yolo11n_int8.tflite    # direct-load fallback
+│   └── ...
+├── onnx/                          # FP32 ONNX (input to ModelConverter)
+│   ├── yolo11n.onnx
+│   └── ...
+├── oak/                           # Luxonis OAK / RVC2 (.blob/.superblob)
+│   └── yolo11n/yolo11n.blob
+└── oak4/                          # Luxonis OAK4 / RVC4 (.dlc)
+    └── yolo11n/yolo11n.dlc
 ```
 
 ---
@@ -669,6 +676,89 @@ pipeline to produce your final deployable INT8 TFLite.
 > binary, flash it to external XSPI flash at address `0x70380000` using
 > STM32CubeProgrammer. The firmware then loads the pre-compiled network
 > directly from flash for maximum performance.
+
+### Luxonis OAK (RVC2 / Myriad-X) and OAK4 (RVC4 / Qualcomm)
+
+OAK / OAK4 run host-driven in **DepthAI v3 peripheral mode**: the host
+opens the device over USB, uploads the pipeline, and pulls decoded
+detections back through output queues — no on-device firmware flashing.
+
+**Conversion is offline-only and built from scratch.** Both the RVC2
+and RVC4 [Luxonis ModelConverter](https://docs.luxonis.com/software-v3/ai-inference/conversion/rvc-conversion/offline/modelconverter/)
+images are built locally via `docker/oak/build.sh`, which clones the
+upstream `luxonis/modelconverter` repo at a pinned tag and runs its
+own Dockerfiles against the SDK archives you supply. Nothing is
+pulled from Docker Hub.
+
+The two SDK archives are licence-gated and cannot be redistributed.
+Download them yourself, rename them to the exact filenames below, and
+drop them into `docker/oak/extra_packages/` (gitignored):
+
+| Target | File | Source |
+| ------ | ---- | ------ |
+| RVC2 (OAK)   | `openvino-2022.3.0.tar.gz` (Linux x86_64 **dev** archive from the 2022.3.2 patch release; keep the `2022.3.0` filename so the upstream Dockerfile's hard-coded conditionals fire) | <https://storage.openvinotoolkit.org/repositories/openvino/packages/2022.3.2/linux/> |
+| RVC4 (OAK4)  | `snpe-2.32.6.zip` (Linux x86_64 SDK)                      | <https://softwarecenter.qualcomm.com/catalog/item/Qualcomm_AI_Runtime_Community> |
+
+> **Host architecture.** Both Luxonis Dockerfiles hard-code x86_64
+> library paths and both SDKs ship x86_64 Linux binaries only. The
+> build script forces `--platform linux/amd64` and the export pipeline
+> runs the converter container the same way, so Apple Silicon / ARM
+> Linux hosts will work via QEMU emulation (slower, but correct).
+> First-time setup on ARM Linux:
+> `docker run --rm --privileged tonistiigi/binfmt --install amd64`.
+> Docker Desktop on macOS/Windows ships QEMU pre-configured.
+> See `docker/oak/extra_packages/README.md` for archive-variant details.
+
+Then build:
+
+```bash
+docker/oak/build.sh                 # both rvc2 and rvc4 (default)
+docker/oak/build.sh rvc2            # rvc2 only
+docker/oak/build.sh rvc4 --no-cache # rebuild rvc4 from scratch
+```
+
+This produces `luxonis/modelconverter-rvc2:local` and
+`luxonis/modelconverter-rvc4:local` — the default tags the export
+pipeline looks for. Override with `--oak-rvc2-image` /
+`--oak-rvc4-image` if you tagged differently. To pin a different
+upstream ref or SDK version, set `MODELCONVERTER_REF`,
+`OPENVINO_VERSION`, or `SNPE_VERSION` when invoking the script (see
+`docker/oak/build.sh --help`).
+
+Run the export end-to-end:
+
+```bash
+# Compile all four models for both targets (uses the Ultralytics-default
+# VisDrone val split for INT8 calibration):
+uv run python train_and_export.py --skip-train --skip-npu --oak-target both
+```
+
+**Run on the device:**
+
+```bash
+uv sync --extra oak                    # depthai>=3, opencv-python
+cp export/oak/yolo11n/yolo11n.blob oak-scripts/
+python oak-scripts/main_yolo11n.py     # plug an OAK / OAK4 first
+```
+
+The OAK scripts produce the same `FPS:X.X total=Y Left=Z | Right=W`
+printout as the OpenMV scripts (see [Serial Output Format](#5-serial-output-format)).
+A live OpenCV window shows region overlays + per-zone counts; pass
+`--no-display` to run headless.
+
+#### OAK / OAK4 known limits
+
+- **YOLO11 vs YOLO26 nodes.** YOLO11 (anchor-free, NMS-required) runs
+  through `dai.node.YoloDetectionNetwork` — on-device decode + NMS for
+  highest FPS. YOLO26 (NMS-free end-to-end head) emits already-final
+  boxes; the pipeline uses `dai.node.NeuralNetwork` with a small host
+  parser instead.
+- **RVC2 + small @ 320.** `yolo11s` / `yolo26s` at 320×320 INT8 may
+  exceed Myriad-X SHAVE memory and fail conversion. Workaround:
+  re-export at 256 with `--imgsz-export 256` and update `IMGSZ` in the
+  matching `oak-scripts/main_yolo*s.py`. RVC4 has no such limit.
+- **Peripheral mode only.** Standalone (on-device-only) operation is
+  out of scope here — the host must remain connected over USB.
 
 ---
 

@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """
-YOLO Object Detection Training Pipeline for OpenMV AE3 & N6
-=============================================================
+YOLO Object Detection Training Pipeline for OpenMV AE3 / N6 + Luxonis OAK / OAK4
+=================================================================================
 
 Trains YOLO11n, YOLO11s, YOLO26n, YOLO26s on VisDrone dataset, exports
-INT8 TFLite models, then compiles NPU-optimised images for:
+INT8 TFLite + ONNX, then compiles NPU-optimised binaries for:
 
-  - OpenMV AE3  (Alif Ensemble E3 / Ethos-U55)  → Vela-compiled TFLite
-  - OpenMV N6   (STM32N6 / Neural-ART NPU)       → stedgeai network binary
+  - OpenMV AE3   (Alif Ensemble E3 / Ethos-U55)  → Vela-compiled TFLite
+  - OpenMV N6    (STM32N6 / Neural-ART NPU)       → stedgeai network binary
+  - Luxonis OAK  (RVC2 / Myriad-X)               → .blob via ModelConverter (Docker)
+  - Luxonis OAK4 (RVC4 / Qualcomm)               → .dlc  via ModelConverter (Docker)
 
 Usage:
     python train_and_export.py                       # full pipeline
     python train_and_export.py --skip-train          # export only (re-uses best.pt)
     python train_and_export.py --models yolo11n      # single model
     python train_and_export.py --imgsz 256           # custom input size
+    python train_and_export.py --skip-oak            # skip OAK / OAK4 compilation
+    python train_and_export.py --oak-target rvc4     # OAK4 only
 
 Requirements:
     pip install ultralytics ethos-u-vela             # vela for AE3
     # stedgeai CLI from ST must be on PATH for N6    # or skip N6 compilation
+    # docker (Engine 24+) with luxonis/modelconverter-rvc2:local /
+    #   -rvc4:local images for OAK / OAK4 — build both from scratch with
+    #   docker/oak/build.sh (requires user-supplied OpenVINO + SNPE archives,
+    #   see docker/oak/extra_packages/README.md).
 
 VisDrone classes (10):
     pedestrian, people, bicycle, car, van, truck,
@@ -477,6 +485,245 @@ def compile_stedgeai(
 
 
 # ---------------------------------------------------------------------------
+# Step 3c: ONNX export (shared intermediate for Luxonis ModelConverter)
+# ---------------------------------------------------------------------------
+
+def export_onnx(
+    best_pt: Path,
+    model_name: str,
+    imgsz_export: int,
+    output_dir: Path,
+) -> Path:
+    """Export trained model to FP32 ONNX with static shapes.
+
+    ONNX is the input format consumed by ``luxonis/modelconverter`` for
+    both RVC2 (.blob via OpenVINO) and RVC4 (.dlc via SNPE) targets. INT8
+    quantisation happens inside ModelConverter using the calibration
+    images supplied to ``compile_modelconverter`` — keeping ONNX in FP32
+    avoids double-quantisation and lets each backend pick its own
+    quantiser.
+
+    Returns path to ``<output_dir>/<model>.onnx``.
+    """
+    from ultralytics import YOLO
+
+    log(f"EXPORTING {model_name} → ONNX FP32 (imgsz={imgsz_export})")
+
+    model = YOLO(str(best_pt))
+    result_path = model.export(
+        format="onnx",
+        imgsz=imgsz_export,
+        opset=12,
+        simplify=True,
+        nms=False,
+        dynamic=False,
+        int8=False,
+    )
+    result_path = Path(result_path)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dst = output_dir / f"{model_name}.onnx"
+    shutil.copy2(result_path, dst)
+    print(f"  ✓ ONNX FP32: {dst}  ({dst.stat().st_size / 1024:.0f} KB)")
+    return dst
+
+
+# ---------------------------------------------------------------------------
+# Step 3d: Luxonis ModelConverter (OAK RVC2 / OAK4 RVC4)
+# ---------------------------------------------------------------------------
+
+def _resolve_oak_calib_dir(user_dir: str | None) -> Path | None:
+    """Pick a calibration image directory for OAK INT8 conversion.
+
+    Priority:
+      1. User-supplied ``--oak-calib-dir`` (must exist).
+      2. Ultralytics-default VisDrone val split:
+         ``~/datasets/VisDrone/VisDrone2019-DET-val/images``.
+
+    Returns ``None`` if neither is usable; the caller should warn and
+    skip rather than fail the whole pipeline.
+    """
+    if user_dir:
+        p = Path(user_dir).expanduser().resolve()
+        if not p.is_dir():
+            print(f"  ⚠  --oak-calib-dir {p} does not exist or is not a directory.")
+            return None
+        return p
+
+    default = (
+        Path.home()
+        / "datasets"
+        / "VisDrone"
+        / "VisDrone2019-DET-val"
+        / "images"
+    )
+    if default.is_dir():
+        return default
+
+    print(
+        f"  ⚠  No --oak-calib-dir given and the Ultralytics default "
+        f"({default}) is missing.\n"
+        "     Train once or download VisDrone first, then re-run with "
+        "--oak-calib-dir <path>."
+    )
+    return None
+
+
+def _write_modelconverter_yaml(
+    onnx_path: Path,
+    imgsz: int,
+    target: str,
+    calib_dir: Path,
+    output_dir: Path,
+) -> Path:
+    """Write a minimal modelconverter YAML for one (model, target) pair.
+
+    See https://docs.luxonis.com/software-v3/ai-inference/conversion/rvc-conversion/offline/modelconverter/
+    for the schema. We deliberately keep this minimal — anything more
+    elaborate (per-output dequant, custom op fusion, multi-input models)
+    should be supplied via ``--oak-config``.
+    """
+    cfg_path = output_dir / "modelconverter.yaml"
+    superblob = "true" if target == "rvc2" else "false"
+    yaml = (
+        "input_model: {onnx_rel}\n"
+        "inputs:\n"
+        "  - name: images\n"
+        "    shape: [1, 3, {imgsz}, {imgsz}]\n"
+        "    mean: [0.0, 0.0, 0.0]\n"
+        "    scale: [255.0, 255.0, 255.0]\n"
+        "    encoding:\n"
+        "      from: RGB\n"
+        "      to: BGR\n"
+        "calibration:\n"
+        "  path: {calib_rel}\n"
+        "  max_images: 200\n"
+        "targets:\n"
+        "  {target}:\n"
+        "    precision: int8\n"
+        "    superblob: {superblob}\n"
+    ).format(
+        onnx_rel=onnx_path.name,
+        imgsz=imgsz,
+        calib_rel=str(calib_dir),
+        target=target,
+        superblob=superblob,
+    )
+    cfg_path.write_text(yaml)
+    return cfg_path
+
+
+def compile_modelconverter(
+    onnx_path: Path,
+    model_name: str,
+    imgsz: int,
+    target: str,
+    output_dir: Path,
+    image_tag: str,
+    calib_dir: Path | None,
+    user_config: Path | None = None,
+) -> Path | None:
+    """Run ``luxonis/modelconverter`` Docker image to compile ONNX → blob/dlc.
+
+    Parameters
+    ----------
+    onnx_path : Path
+        FP32 ONNX produced by ``export_onnx``.
+    target : {"rvc2", "rvc4"}
+        ``rvc2`` → OAK / Myriad-X (.blob/.superblob).
+        ``rvc4`` → OAK4 / Qualcomm (.dlc).
+    image_tag : str
+        Docker image to invoke. Default ``luxonis/modelconverter-rvc2:latest`` /
+        ``luxonis/modelconverter-rvc4:latest``. The RVC4 image must be built
+        locally — see ``docker/oak4-modelconverter.Dockerfile``.
+    user_config : Path | None
+        If provided, used verbatim instead of the auto-generated YAML.
+
+    Returns the path to the produced artefact, or ``None`` on failure.
+    """
+    pretty_target = "OAK / RVC2" if target == "rvc2" else "OAK4 / RVC4"
+    log(f"COMPILING {model_name} with ModelConverter for {pretty_target}")
+
+    if not which("docker"):
+        print("  ⚠  'docker' not found on PATH – install Docker Engine 24+.")
+        print(f"     Skipping {pretty_target} compilation.")
+        return None
+
+    if calib_dir is None and user_config is None:
+        print(
+            f"  ⚠  No calibration directory available for {pretty_target}; "
+            "skipping. Pass --oak-calib-dir or --oak-config."
+        )
+        return None
+
+    # RVC2 + small @ 320 is borderline on Myriad-X SHAVE memory. Warn but
+    # continue — the converter will surface the real error if it OOMs.
+    if target == "rvc2" and model_name.endswith("s") and imgsz > 288:
+        print(
+            f"  ⚠  RVC2 + {model_name} @ {imgsz}px may exceed Myriad-X "
+            "SHAVE budget. If conversion fails, retry with "
+            "--imgsz-export 256."
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stage the ONNX next to the YAML so paths in the config are
+    # relative — keeps the Docker mount layout simple.
+    staged_onnx = output_dir / onnx_path.name
+    if staged_onnx.resolve() != onnx_path.resolve():
+        shutil.copy2(onnx_path, staged_onnx)
+
+    if user_config is not None:
+        cfg_path = output_dir / "modelconverter.yaml"
+        shutil.copy2(user_config, cfg_path)
+    else:
+        cfg_path = _write_modelconverter_yaml(
+            staged_onnx, imgsz, target, calib_dir, output_dir
+        )
+
+    # Mount the work dir AND the calibration dir (which may live outside
+    # the project tree, e.g. ~/datasets/...). Pin --platform linux/amd64
+    # because the upstream modelconverter Dockerfiles hard-code x86_64
+    # library paths and the OpenVINO / SNPE SDKs ship x86_64 binaries
+    # only — Docker uses QEMU on ARM hosts to run the same image.
+    work_abs = output_dir.resolve()
+    docker_cmd = [
+        "docker", "run", "--rm",
+        "--platform", "linux/amd64",
+        "-v", f"{work_abs}:/work",
+        "-w", "/work",
+    ]
+    if calib_dir is not None:
+        docker_cmd += ["-v", f"{calib_dir.resolve()}:{calib_dir}:ro"]
+    docker_cmd += [
+        image_tag,
+        "convert", target,
+        "--config", "modelconverter.yaml",
+        "--output", "/work",
+    ]
+
+    rc = run_cmd(docker_cmd)
+    if rc != 0:
+        print(f"  ✗ ModelConverter ({pretty_target}) failed (exit {rc})")
+        return None
+
+    suffix = ".blob" if target == "rvc2" else ".dlc"
+    candidates = sorted(output_dir.rglob(f"*{suffix}"))
+    if not candidates:
+        # ModelConverter sometimes writes .superblob for RVC2; accept either.
+        if target == "rvc2":
+            candidates = sorted(output_dir.rglob("*.superblob"))
+    if not candidates:
+        print(f"  ✗ No {suffix} artefact found under {output_dir}")
+        return None
+
+    artefact = candidates[0]
+    print(f"  ✓ {pretty_target} model: {artefact}  "
+          f"({artefact.stat().st_size / 1024:.0f} KB)")
+    return artefact
+
+
+# ---------------------------------------------------------------------------
 # Step 4: Generate labels file
 # ---------------------------------------------------------------------------
 
@@ -535,6 +782,39 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--skip-npu", action="store_true",
         help="Skip NPU compilation (Vela / STEdgeAI)"
+    )
+    # ---- Luxonis OAK / OAK4 -----------------------------------------
+    p.add_argument(
+        "--skip-oak", action="store_true",
+        help="Skip OAK / OAK4 compilation (ONNX export + ModelConverter)"
+    )
+    p.add_argument(
+        "--oak-target", choices=["rvc2", "rvc4", "both"], default="both",
+        help="Which Luxonis target(s) to compile for (default: both)"
+    )
+    p.add_argument(
+        "--oak-rvc2-image", type=str,
+        default="luxonis/modelconverter-rvc2:local",
+        help="Docker image tag for the RVC2 (OAK) converter "
+             "(default: luxonis/modelconverter-rvc2:local — built from "
+             "scratch by docker/oak/build.sh)"
+    )
+    p.add_argument(
+        "--oak-rvc4-image", type=str,
+        default="luxonis/modelconverter-rvc4:local",
+        help="Docker image tag for the RVC4 (OAK4) converter "
+             "(default: luxonis/modelconverter-rvc4:local — built from "
+             "scratch by docker/oak/build.sh)"
+    )
+    p.add_argument(
+        "--oak-calib-dir", type=str, default=None,
+        help="Calibration image dir for INT8 quantisation (default: "
+             "~/datasets/VisDrone/VisDrone2019-DET-val/images)"
+    )
+    p.add_argument(
+        "--oak-config", type=str, default=None,
+        help="Optional path to a user-supplied modelconverter YAML, "
+             "applied verbatim (overrides auto-generated config)."
     )
     p.add_argument(
         "--project", type=str, default="runs/visdrone",
@@ -602,23 +882,41 @@ def main() -> None:
             best_pt, model_name, export_imgsz, tflite_dir
         )
 
-        if args.skip_npu:
-            continue
+        if not args.skip_npu:
+            # --- Compile for AE3 (Vela) ----------------------------------
+            ae3_dir = output_root / "ae3" / model_name
+            compile_vela(tflite_path, model_name, ae3_dir)
 
-        # --- Compile for AE3 (Vela) --------------------------------------
-        ae3_dir = output_root / "ae3" / model_name
-        compile_vela(tflite_path, model_name, ae3_dir)
+            # Also copy the raw INT8 TFLite for AE3 (fallback / CPU mode)
+            shutil.copy2(tflite_path, ae3_dir / tflite_path.name)
 
-        # Also copy the raw INT8 TFLite for AE3 (fallback / CPU mode)
-        shutil.copy2(tflite_path, ae3_dir / tflite_path.name)
+            # --- Compile for N6 (STEdgeAI) -------------------------------
+            n6_dir = output_root / "n6" / model_name
+            compile_stedgeai(tflite_path, model_name, n6_dir)
 
-        # --- Compile for N6 (STEdgeAI) -----------------------------------
-        n6_dir = output_root / "n6" / model_name
-        compile_stedgeai(tflite_path, model_name, n6_dir)
+            # Also copy the raw INT8 TFLite for N6 (firmware loads it directly)
+            n6_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(tflite_path, n6_dir / tflite_path.name)
 
-        # Also copy the raw INT8 TFLite for N6 (firmware loads it directly)
-        n6_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(tflite_path, n6_dir / tflite_path.name)
+        # --- ONNX + Luxonis ModelConverter (OAK / OAK4) ------------------
+        if not args.skip_oak:
+            onnx_dir = output_root / "onnx"
+            onnx_path = export_onnx(best_pt, model_name, export_imgsz, onnx_dir)
+            calib_dir = _resolve_oak_calib_dir(args.oak_calib_dir)
+            user_cfg = Path(args.oak_config).expanduser() if args.oak_config else None
+
+            if args.oak_target in ("rvc2", "both"):
+                compile_modelconverter(
+                    onnx_path, model_name, export_imgsz, "rvc2",
+                    output_root / "oak" / model_name,
+                    args.oak_rvc2_image, calib_dir, user_cfg,
+                )
+            if args.oak_target in ("rvc4", "both"):
+                compile_modelconverter(
+                    onnx_path, model_name, export_imgsz, "rvc4",
+                    output_root / "oak4" / model_name,
+                    args.oak_rvc4_image, calib_dir, user_cfg,
+                )
 
     # --- Summary ----------------------------------------------------------
     log("PIPELINE COMPLETE")
@@ -635,10 +933,16 @@ def main() -> None:
 
     print(
         "\n  Next steps:\n"
-        "  1. Copy the model .tflite (or _vela.tflite for AE3) + labels.txt\n"
-        "     to your OpenMV Cam's internal flash or SD card.\n"
-        "  2. Upload the matching MicroPython script from openmv-scripts/.\n"
-        "  3. Run from OpenMV IDE or on boot.\n"
+        "  OpenMV (AE3 / N6):\n"
+        "    1. Copy the model .tflite (or _vela.tflite for AE3) + labels.txt\n"
+        "       to your OpenMV Cam's internal flash or SD card.\n"
+        "    2. Upload the matching MicroPython script from openmv-scripts/.\n"
+        "    3. Run from OpenMV IDE or on boot.\n"
+        "  Luxonis OAK / OAK4 (DepthAI v3 peripheral mode):\n"
+        "    1. Place the .blob (OAK) or .dlc (OAK4) next to the matching\n"
+        "       oak-scripts/main_yolo*.py, or pass --model on the command line.\n"
+        "    2. uv sync --extra oak  (installs depthai + opencv-python).\n"
+        "    3. python oak-scripts/main_yolo<model>.py\n"
     )
 
 

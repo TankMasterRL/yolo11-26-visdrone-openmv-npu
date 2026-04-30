@@ -14,6 +14,16 @@ export/
 *.pt
 *.tflite
 *.onnx
+*.blob
+*.superblob
+*.dlc
+
+# OAK / OAK4 local Docker build artefacts
+# - extra_packages/ holds licence-gated SDK archives users supply locally
+#   (see docker/oak/extra_packages/README.md)
+# - build/ is the working clone of luxonis/modelconverter created by
+#   docker/oak/build.sh
+docker/oak/build/
 
 # IDE
 .vscode/

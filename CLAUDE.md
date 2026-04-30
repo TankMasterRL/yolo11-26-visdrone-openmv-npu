@@ -5,14 +5,22 @@ Guidance for Claude Code (and other LLM agents) working in this repo.
 ## What this project is
 
 End-to-end pipeline that **trains** YOLO11n / YOLO11s / YOLO26n / YOLO26s
-on the VisDrone aerial-imagery dataset, **exports** them to INT8 TFLite,
-**compiles** NPU-optimised binaries, and ships ready-to-run **OpenMV
-MicroPython** scripts for region-based object counting on two boards:
+on the VisDrone aerial-imagery dataset, **exports** them to INT8 TFLite
+(plus FP32 ONNX as a shared intermediate), **compiles** NPU-optimised
+binaries, and ships ready-to-run scripts for region-based object
+counting on four hardware targets:
 
 - **OpenMV AE3** — Alif Ensemble E3 / dual Ethos-U55 NPU, compiled via
-  **Arm Vela** → `*_vela.tflite`.
+  **Arm Vela** → `*_vela.tflite`. MicroPython, on-device firmware.
 - **OpenMV N6** — STM32N6 / ST Neural-ART NPU, compiled via **STEdgeAI**
-  → `*_int8.tflite` (firmware auto-routes ops to the NPU).
+  → `*_int8.tflite` (firmware auto-routes ops to the NPU). MicroPython,
+  on-device firmware.
+- **Luxonis OAK** (RVC2 / Myriad-X) — `.blob` / `.superblob` via the
+  upstream `luxonis/modelconverter-rvc2` Docker image (built locally).
+  Host Python + DepthAI v3 peripheral mode.
+- **Luxonis OAK4** (RVC4 / Qualcomm) — `.dlc` via
+  `luxonis/modelconverter-rvc4` (built locally; SNPE SDK is
+  licence-gated). Host Python + DepthAI v3 peripheral mode.
 
 It is a **script collection**, not an installable package
 (`pyproject.toml` sets `[tool.uv] package = false`). Treat
@@ -23,16 +31,23 @@ entry points; everything else supports them.
 
 ```
 .
-├── train_and_export.py        # Train + INT8 TFLite export + Vela / STEdgeAI compile
+├── train_and_export.py        # Train + INT8 TFLite + ONNX + Vela / STEdgeAI / ModelConverter
 ├── tune_hyperparameters.py    # In-house Ray Tune (Optuna TPE + ASHA) sweep
 ├── pyproject.toml             # Single source of truth for deps + extras
 ├── docker/Dockerfile          # GPU image: ultralytics/ultralytics + uv layer
-├── docker-compose.yml         # Services: train / tune / export / tensorboard / shell
+├── docker/oak/
+│   ├── build.sh               # Builds luxonis/modelconverter-{rvc2,rvc4}:local from upstream
+│   └── extra_packages/        # Drop-in for licence-gated OpenVINO + SNPE archives (gitignored)
+├── docker-compose.yml         # Services: train / tune / export / oak-export / tensorboard / shell
 ├── notebooks/visdrone_pipeline.ipynb   # End-to-end Colab/Paperspace notebook
-├── openmv-scripts/
+├── openmv-scripts/            # On-device MicroPython (AE3 + N6)
 │   ├── region_counter.py      # Shared MicroPython region-counting module
 │   ├── ae3/main_yolo*.py      # Per-model AE3 entry points
 │   └── n6/main_yolo*.py       # Per-model N6 entry points
+├── oak-scripts/               # Host Python (DepthAI v3 peripheral mode for OAK + OAK4)
+│   ├── region_counter.py      # NumPy/OpenCV port of the MicroPython module (host-only)
+│   ├── _pipeline.py           # Shared DepthAI v3 pipeline builder + run loop
+│   └── main_yolo*.py          # Per-model thin entry points
 └── README.md                  # Long-form user docs (architecture + recipes)
 ```
 
@@ -49,9 +64,16 @@ syntax checks and `--help` smoke tests on the two CLIs.
   - `tune` → `ray[tune]`, `optuna`, `tensorboard`
   - `export` → full TFLite INT8 chain (`tensorflow`, `tf_keras`, `onnx`,
     `onnx2tf`, `onnxslim`, `onnxruntime`, `ai-edge-litert`, `protobuf`, ...)
+  - `oak` → `depthai>=3`, `opencv-python`, `numpy` (host runtime for the
+    DepthAI v3 peripheral-mode scripts under `oak-scripts/`)
   - `all` → everything pip-installable
 - **STEdgeAI** is proprietary (ST), download separately and bind-mount
   at `/opt/stedgeai` for the Docker `export` service.
+- **OAK / OAK4 conversion toolchain** is intentionally NOT pip-installable.
+  It runs as a sibling Docker container (`luxonis/modelconverter-rvc2:local`
+  / `-rvc4:local`) built from upstream sources by `docker/oak/build.sh`
+  using user-supplied OpenVINO + Qualcomm SNPE archives. See
+  `docker/oak/extra_packages/README.md`.
 
 ## Common commands
 
@@ -84,6 +106,18 @@ docker compose run --rm train
 docker compose run --rm tune
 docker compose run --rm export       # skip-train: re-uses runs/visdrone/*/best.pt
 docker compose up tensorboard        # http://localhost:6006
+
+# OAK / OAK4: build the converter images locally from upstream sources
+# (drop OpenVINO + SNPE archives into docker/oak/extra_packages/ first)
+docker/oak/build.sh                  # both rvc2 and rvc4
+docker/oak/build.sh rvc4 --no-cache  # rebuild RVC4 only
+
+# Compile every model for both OAK targets (skips train + Vela/STEdgeAI)
+uv run python train_and_export.py --skip-train --skip-npu --oak-target both
+
+# Run the host-side DepthAI v3 region-counter (peripheral mode)
+uv sync --extra oak
+python oak-scripts/main_yolo11n.py
 ```
 
 The Docker image uses the **same `pyproject.toml`** the host uses (via
@@ -107,6 +141,14 @@ directly.
   to f% mem). `enable_gpu_fast_path()` flips on cuDNN benchmark + TF32.
 - Per-model export sizes default to 256 (nano) / 320 (small) to fit
   the AE3/N6 NPU memory budgets — tune with `--imgsz-export`.
+- **Compile-step dispatch.** Each per-model loop iteration produces
+  TFLite INT8, then optionally compiles for AE3 (Vela), N6 (STEdgeAI),
+  and OAK / OAK4. The OAK path goes via `export_onnx()` (FP32 ONNX with
+  `nms=False`, opset 12, static shapes — Ultralytics writes it once and
+  both RVC2 and RVC4 reuse the same artefact) and `compile_modelconverter()`
+  (Docker-driven; auto-generates a per-target YAML or honours
+  `--oak-config`). Skip flags: `--skip-npu` (Vela + STEdgeAI),
+  `--skip-oak` (ONNX + ModelConverter). Targets: `--oak-target {rvc2,rvc4,both}`.
 
 ### `tune_hyperparameters.py`
 - Drives Ultralytics' built-in `model.tune(use_ray=True, ...)`
@@ -145,6 +187,27 @@ directly.
   `import region_counter` and run the corresponding `*_int8.tflite` /
   `*_vela.tflite` model from on-board flash or SD. Keep them small —
   the OpenMV firmware has tight RAM budgets.
+
+### `oak-scripts/`
+- **Host Python**, not MicroPython — separate sibling directory to
+  `openmv-scripts/` because the runtime is structurally different
+  (DepthAI v3 + OpenCV + NumPy, not on-device firmware). Don't try to
+  share `region_counter.py` between the two — `oak-scripts/region_counter.py`
+  is a deliberate NumPy/OpenCV port with the same public API.
+- `_pipeline.py` builds the pipeline once and is shared by every
+  `main_yolo*.py`. Topology: `Camera.requestOutput(BGR888p, LETTERBOX)`
+  → NN node → host queues. The `LETTERBOX` resize happens at the ISP
+  (no extra `ImageManip` hop), matching OpenMV's auto-letterbox.
+- **YOLO family dispatch.** `family="yolo11"` uses `dai.node.YoloDetectionNetwork`
+  for on-device decode + NMS (highest FPS). `family="yolo26"` uses
+  `dai.node.NeuralNetwork` plus a small NumPy parser, because YOLO26's
+  end-to-end head emits already-final boxes and re-running NMS would
+  corrupt them.
+- The `main_yolo*.py` scripts are 30-line entry points that import
+  `cli_parser` + `run` from `_pipeline`. Keep them as thin shims —
+  add new model families by extending `_pipeline.build_pipeline`.
+- The build artefacts (`*.blob`, `*.superblob`, `*.dlc`) are gitignored
+  alongside `*.tflite` / `*.onnx`. Don't commit them.
 
 ## Branching & commit conventions
 
@@ -244,8 +307,51 @@ declines them.
    3.14 builds — if you hit a wheel-not-found error in CI, the fix is
    to wait for the upstream wheel, not to downgrade Python.
 
-5. **`runs/`, `export/`, `*.pt`, `*.tflite`, `*.onnx` are gitignored.**
-   Don't commit training artefacts or weights.
+5. **`runs/`, `export/`, `*.pt`, `*.tflite`, `*.onnx`, `*.blob`,
+   `*.superblob`, `*.dlc`, `docker/oak/build/`, and
+   `docker/oak/extra_packages/*.{tar.gz,tgz,zip}` are gitignored.**
+   Don't commit training artefacts, weights, or licence-gated SDK
+   archives.
+
+6. **OpenVINO archive name vs contents.** `docker/oak/build.sh` defaults
+   `OPENVINO_VERSION=2022.3.0` and expects `openvino-2022.3.0.tar.gz` in
+   `docker/oak/extra_packages/`, but the README points users at the
+   **2022.3.2 patch release** download. This is intentional: the upstream
+   `luxonis/modelconverter` RVC2 Dockerfile has three hard-coded
+   conditionals that only fire on `VERSION=2022.3.0` (archive
+   strip-components count, `/opt/intel/tools/*.whl` cleanup, and the
+   `convert_impl.py` patch selection). Anything else drops into the
+   2021.4.0 legacy branch and fails. 2022.3.2 is a drop-in patch with
+   the same archive layout and `/opt/intel/...` paths, so staging it
+   under the `2022.3.0` filename + arg gives users the newer binaries
+   while keeping the build steps that work. **Do not rename it to
+   `openvino-2022.3.2.tar.gz`** unless you also patch the upstream
+   Dockerfile's conditionals.
+
+7. **OAK / OAK4 conversion is `linux/amd64` only.** Both upstream
+   Dockerfiles `COPY` files from `/usr/lib/x86_64-linux-gnu/` in their
+   second stage, and the OpenVINO + SNPE SDKs ship x86_64 binaries
+   only. `docker/oak/build.sh` and the `docker run` in
+   `compile_modelconverter` both pin `--platform linux/amd64`; on ARM
+   hosts (Apple Silicon, ARM Linux) the build is correct but slow
+   (QEMU emulation). If you ever need to disable the platform pin,
+   override `BUILD_PLATFORM` in the script — but expect the build to
+   fail on non-x86_64 hosts without it.
+
+8. **YOLO11 vs YOLO26 in DepthAI v3.** YOLO11 ships an anchor-free
+   head that expects an external NMS — drive it with
+   `dai.node.YoloDetectionNetwork` for on-device decode + NMS. YOLO26
+   ships a built-in NMS-free end-to-end head; the model emits already
+   final boxes, so re-running NMS via `YoloDetectionNetwork` would
+   corrupt them. Use `dai.node.NeuralNetwork` + the small NumPy parser
+   in `oak-scripts/_pipeline.py` (`_parse_yolo26`). The dispatch lives
+   in `build_pipeline(family=...)`.
+
+9. **OAK (RVC2) + small @ 320 may exceed Myriad-X SHAVE memory.**
+   `compile_modelconverter` warns when `target=="rvc2"` and the model
+   is `*s` and `imgsz > 288`, then continues. If the converter exits
+   non-zero with an OOM/SHAVE allocation error, retry with
+   `--imgsz-export 256`. RVC4 has no such limit.
 
 ## When in doubt
 
@@ -257,5 +363,15 @@ declines them.
   cause, suspect **Ray version drift inside Ultralytics**
   (bump `ultralytics>=...` in `pyproject.toml`) or the **PyTorch
   upsample decomposition** before suspecting our code.
+- If the OAK / OAK4 `docker build` fails with "no such file or
+  directory" pointing at `/usr/lib/x86_64-linux-gnu/...`, you're
+  building on a non-x86_64 host without QEMU set up. See gotcha #7.
+  If it fails on the OpenVINO `rm -r` or `patch` step, you renamed
+  the archive away from `openvino-2022.3.0.tar.gz` — see gotcha #6.
+- For the upstream `luxonis/modelconverter` Dockerfiles: prefer
+  cloning their repo as a build context (what `docker/oak/build.sh`
+  does) over forking our own Dockerfiles. The upstream owns the
+  RVC2/RVC4 build recipes; we just call them. If a Luxonis update
+  breaks our defaults, bump `MODELCONVERTER_REF` in `build.sh`.
 - Prefer small, focused branches. The git history shows the cadence:
   one bug = one branch = one commit on `main`.

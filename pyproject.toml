@@ -42,6 +42,18 @@ export = [
     "ai-edge-litert>=2.0.0",
     "protobuf>=5",
 ]
+# Luxonis OAK (RVC2 / Myriad-X) and OAK4 (RVC4 / Qualcomm) host-side runtime
+# for the DepthAI v3 peripheral-mode scripts under oak-scripts/.
+#
+# Note: the offline conversion toolchain (Luxonis ModelConverter, OpenVINO,
+# Qualcomm SNPE) is intentionally NOT pip-installable here — it ships as
+# Docker images invoked by train_and_export.py. The RVC4 image must be
+# built locally; see docker/oak4-modelconverter.Dockerfile.
+oak = [
+    "depthai>=3.0.0",
+    "opencv-python>=4.10",
+    "numpy>=1.26",
+]
 # Convenience group for everything installable via pip
 all = [
     "ultralytics>=8.4.41",
@@ -59,6 +71,8 @@ all = [
     "onnx_graphsurgeon>=0.5.0",
     "ai-edge-litert>=2.0.0",
     "protobuf>=5",
+    "depthai>=3.0.0",
+    "opencv-python>=4.10",
 ]
 
 [tool.uv]
