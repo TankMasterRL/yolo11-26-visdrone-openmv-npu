@@ -14,6 +14,13 @@ export/
 *.pt
 *.tflite
 *.onnx
+*.blob
+*.superblob
+*.dlc
+
+# Qualcomm SNPE SDK drop-in for the OAK4 Dockerfile (licence-gated;
+# users supply locally — see docker/oak4-modelconverter.Dockerfile).
+docker/snpe/
 
 # IDE
 .vscode/

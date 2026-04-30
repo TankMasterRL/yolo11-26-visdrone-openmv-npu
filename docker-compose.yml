@@ -126,6 +126,43 @@ services:
     command: ["python", "train_and_export.py", "--skip-train"]
 
   # ----------------------------------------------------------------------
+  # OAK / OAK4 export-only service — runs the ONNX export + Luxonis
+  # ModelConverter compilation stages (skips training and the AE3/N6
+  # NPU steps) for all four models.
+  #
+  # ModelConverter is invoked as a sibling Docker container, so this
+  # service mounts /var/run/docker.sock to talk to the host's Docker
+  # daemon (Docker-out-of-Docker). Build the RVC4 image first per
+  # docker/oak4-modelconverter.Dockerfile, and ensure the RVC2 image
+  # is pulled (`docker pull luxonis/modelconverter-rvc2:latest`).
+  #
+  # The default command compiles for both RVC2 and RVC4 using the
+  # Ultralytics-default VisDrone val split for INT8 calibration. Override
+  # to compile only one target, or to point at a custom calibration set:
+  #     docker compose run --rm oak-export python train_and_export.py \
+  #         --skip-train --skip-npu --oak-target rvc4 \
+  #         --oak-calib-dir /datasets/VisDrone/VisDrone2019-DET-val/images
+  # ----------------------------------------------------------------------
+  oak-export:
+    <<: *gpu-service
+    container_name: yolo-visdrone-oak-export
+    volumes:
+      - .:/workspace
+      - datasets:/datasets
+      - ultralytics-cache:/root/.config/Ultralytics
+      - pip-cache:/root/.cache/pip
+      # Docker-out-of-Docker: required so the container can launch
+      # luxonis/modelconverter-rvc2 / -rvc4 sibling containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+    command:
+      - python
+      - train_and_export.py
+      - --skip-train
+      - --skip-npu
+      - --oak-target
+      - both
+
+  # ----------------------------------------------------------------------
   # TensorBoard server — visualises every training run and Ray Tune
   # trial. Browse to http://localhost:6006 once the container is up.
   # ----------------------------------------------------------------------
