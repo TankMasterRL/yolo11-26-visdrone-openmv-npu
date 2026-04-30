@@ -41,6 +41,14 @@
 #                               Default: 2.32.6.
 #     IMAGE_TAG                 Tag suffix applied to both images.
 #                               Default: local.
+#     BUILD_PLATFORM            Docker build/run platform. Default: linux/amd64.
+#                               The upstream Dockerfiles hard-code
+#                               /usr/lib/x86_64-linux-gnu/ paths and the SDK
+#                               archives ship x86_64 binaries only, so the
+#                               image MUST be built (and run) as linux/amd64
+#                               regardless of host architecture. On ARM hosts
+#                               Docker uses QEMU emulation — the build is
+#                               slow but correct.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -48,6 +56,7 @@ MODELCONVERTER_REF="${MODELCONVERTER_REF:-v0.5.3-beta}"
 OPENVINO_VERSION="${OPENVINO_VERSION:-2022.3.0}"
 SNPE_VERSION="${SNPE_VERSION:-2.32.6}"
 IMAGE_TAG="${IMAGE_TAG:-local}"
+BUILD_PLATFORM="${BUILD_PLATFORM:-linux/amd64}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -92,6 +101,17 @@ if ! command -v git >/dev/null 2>&1; then
     exit 1
 fi
 
+# Host architecture sanity check. Both upstream Dockerfiles hard-code
+# x86_64 library paths and the SDK archives are x86_64-Linux only; on
+# non-x86_64 hosts we rely on QEMU emulation under linux/amd64.
+HOST_ARCH="$(uname -m)"
+if [[ "${HOST_ARCH}" != "x86_64" && "${HOST_ARCH}" != "amd64" ]]; then
+    echo ">> Host architecture is ${HOST_ARCH}; building under ${BUILD_PLATFORM}"
+    echo ">> via QEMU emulation. Initial setup on ARM Linux may need:"
+    echo ">>     docker run --rm --privileged tonistiigi/binfmt --install amd64"
+    echo ">> Docker Desktop on macOS/Windows ships QEMU pre-configured."
+fi
+
 # ---------------------------------------------------------------------------
 # 1. Fetch / refresh the pinned modelconverter source tree
 # ---------------------------------------------------------------------------
@@ -129,8 +149,9 @@ stage_archive() {
 # ---------------------------------------------------------------------------
 build_rvc2() {
     stage_archive "openvino-${OPENVINO_VERSION}.tar.gz"
-    echo ">> Building luxonis/modelconverter-rvc2:${IMAGE_TAG}"
+    echo ">> Building luxonis/modelconverter-rvc2:${IMAGE_TAG} (${BUILD_PLATFORM})"
     docker build "${DOCKER_BUILD_FLAGS[@]}" \
+        --platform "${BUILD_PLATFORM}" \
         --build-arg "VERSION=${OPENVINO_VERSION}" \
         -f "${SRC_DIR}/docker/rvc2/Dockerfile" \
         -t "luxonis/modelconverter-rvc2:${IMAGE_TAG}" \
@@ -139,8 +160,9 @@ build_rvc2() {
 
 build_rvc4() {
     stage_archive "snpe-${SNPE_VERSION}.zip"
-    echo ">> Building luxonis/modelconverter-rvc4:${IMAGE_TAG}"
+    echo ">> Building luxonis/modelconverter-rvc4:${IMAGE_TAG} (${BUILD_PLATFORM})"
     docker build "${DOCKER_BUILD_FLAGS[@]}" \
+        --platform "${BUILD_PLATFORM}" \
         --build-arg "VERSION=${SNPE_VERSION}" \
         -f "${SRC_DIR}/docker/rvc4/Dockerfile" \
         -t "luxonis/modelconverter-rvc4:${IMAGE_TAG}" \

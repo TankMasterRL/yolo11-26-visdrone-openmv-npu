@@ -696,8 +696,18 @@ drop them into `docker/oak/extra_packages/` (gitignored):
 
 | Target | File | Source |
 | ------ | ---- | ------ |
-| RVC2 (OAK)   | `openvino-2022.3.0.tar.gz` | <https://storage.openvinotoolkit.org/repositories/openvino/packages/2022.3/linux/> |
-| RVC4 (OAK4)  | `snpe-2.32.6.zip`          | <https://softwarecenter.qualcomm.com/catalog/item/Qualcomm_AI_Runtime_Community> |
+| RVC2 (OAK)   | `openvino-2022.3.0.tar.gz` (Linux x86_64 **dev** archive) | <https://storage.openvinotoolkit.org/repositories/openvino/packages/2022.3/linux/> |
+| RVC4 (OAK4)  | `snpe-2.32.6.zip` (Linux x86_64 SDK)                      | <https://softwarecenter.qualcomm.com/catalog/item/Qualcomm_AI_Runtime_Community> |
+
+> **Host architecture.** Both Luxonis Dockerfiles hard-code x86_64
+> library paths and both SDKs ship x86_64 Linux binaries only. The
+> build script forces `--platform linux/amd64` and the export pipeline
+> runs the converter container the same way, so Apple Silicon / ARM
+> Linux hosts will work via QEMU emulation (slower, but correct).
+> First-time setup on ARM Linux:
+> `docker run --rm --privileged tonistiigi/binfmt --install amd64`.
+> Docker Desktop on macOS/Windows ships QEMU pre-configured.
+> See `docker/oak/extra_packages/README.md` for archive-variant details.
 
 Then build:
 

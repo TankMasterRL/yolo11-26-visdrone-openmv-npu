@@ -682,10 +682,14 @@ def compile_modelconverter(
         )
 
     # Mount the work dir AND the calibration dir (which may live outside
-    # the project tree, e.g. ~/datasets/...).
+    # the project tree, e.g. ~/datasets/...). Pin --platform linux/amd64
+    # because the upstream modelconverter Dockerfiles hard-code x86_64
+    # library paths and the OpenVINO / SNPE SDKs ship x86_64 binaries
+    # only — Docker uses QEMU on ARM hosts to run the same image.
     work_abs = output_dir.resolve()
     docker_cmd = [
         "docker", "run", "--rm",
+        "--platform", "linux/amd64",
         "-v", f"{work_abs}:/work",
         "-w", "/work",
     ]
