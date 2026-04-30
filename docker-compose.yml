@@ -132,9 +132,10 @@ services:
   #
   # ModelConverter is invoked as a sibling Docker container, so this
   # service mounts /var/run/docker.sock to talk to the host's Docker
-  # daemon (Docker-out-of-Docker). Build the RVC4 image first per
-  # docker/oak4-modelconverter.Dockerfile, and ensure the RVC2 image
-  # is pulled (`docker pull luxonis/modelconverter-rvc2:latest`).
+  # daemon (Docker-out-of-Docker). Build BOTH images from scratch first:
+  #     docker/oak/build.sh
+  # which produces luxonis/modelconverter-rvc2:local and -rvc4:local —
+  # the defaults the export pipeline expects.
   #
   # The default command compiles for both RVC2 and RVC4 using the
   # Ultralytics-default VisDrone val split for INT8 calibration. Override

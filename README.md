@@ -683,32 +683,45 @@ OAK / OAK4 run host-driven in **DepthAI v3 peripheral mode**: the host
 opens the device over USB, uploads the pipeline, and pulls decoded
 detections back through output queues — no on-device firmware flashing.
 
-**Conversion is offline-only.** All model conversion goes through the
-[Luxonis ModelConverter](https://docs.luxonis.com/software-v3/ai-inference/conversion/rvc-conversion/offline/modelconverter/)
-Docker image, which accepts ONNX as input and emits `.blob` (RVC2) or
-`.dlc` (RVC4). `train_and_export.py` invokes it automatically when
-`--skip-oak` is not set:
+**Conversion is offline-only and built from scratch.** Both the RVC2
+and RVC4 [Luxonis ModelConverter](https://docs.luxonis.com/software-v3/ai-inference/conversion/rvc-conversion/offline/modelconverter/)
+images are built locally via `docker/oak/build.sh`, which clones the
+upstream `luxonis/modelconverter` repo at a pinned tag and runs its
+own Dockerfiles against the SDK archives you supply. Nothing is
+pulled from Docker Hub.
+
+The two SDK archives are licence-gated and cannot be redistributed.
+Download them yourself, rename them to the exact filenames below, and
+drop them into `docker/oak/extra_packages/` (gitignored):
+
+| Target | File | Source |
+| ------ | ---- | ------ |
+| RVC2 (OAK)   | `openvino-2022.3.0.tar.gz` | <https://storage.openvinotoolkit.org/repositories/openvino/packages/2022.3/linux/> |
+| RVC4 (OAK4)  | `snpe-2.32.6.zip`          | <https://softwarecenter.qualcomm.com/catalog/item/Qualcomm_AI_Runtime_Community> |
+
+Then build:
 
 ```bash
-# RVC2 image is on Docker Hub
-docker pull luxonis/modelconverter-rvc2:latest
-
-# RVC4 image must be built locally — see below
-docker build -f docker/oak4-modelconverter.Dockerfile \
-    -t luxonis/modelconverter-rvc4:local docker/
-
-# Compile all four models for both targets (uses the Ultralytics-default
-# VisDrone val split for INT8 calibration):
-uv run python train_and_export.py --skip-train --skip-npu \
-    --oak-target both \
-    --oak-rvc4-image luxonis/modelconverter-rvc4:local
+docker/oak/build.sh                 # both rvc2 and rvc4 (default)
+docker/oak/build.sh rvc2            # rvc2 only
+docker/oak/build.sh rvc4 --no-cache # rebuild rvc4 from scratch
 ```
 
-The Qualcomm SNPE SDK is licence-gated and cannot be redistributed. To
-build the RVC4 image, accept Qualcomm's licence, download the Neural
-Processing SDK, and drop the archive into `docker/snpe/` (gitignored)
-before running `docker build`. See the header of
-`docker/oak4-modelconverter.Dockerfile` for the exact procedure.
+This produces `luxonis/modelconverter-rvc2:local` and
+`luxonis/modelconverter-rvc4:local` — the default tags the export
+pipeline looks for. Override with `--oak-rvc2-image` /
+`--oak-rvc4-image` if you tagged differently. To pin a different
+upstream ref or SDK version, set `MODELCONVERTER_REF`,
+`OPENVINO_VERSION`, or `SNPE_VERSION` when invoking the script (see
+`docker/oak/build.sh --help`).
+
+Run the export end-to-end:
+
+```bash
+# Compile all four models for both targets (uses the Ultralytics-default
+# VisDrone val split for INT8 calibration):
+uv run python train_and_export.py --skip-train --skip-npu --oak-target both
+```
 
 **Run on the device:**
 

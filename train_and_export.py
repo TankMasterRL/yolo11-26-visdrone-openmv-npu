@@ -22,9 +22,10 @@ Usage:
 Requirements:
     pip install ultralytics ethos-u-vela             # vela for AE3
     # stedgeai CLI from ST must be on PATH for N6    # or skip N6 compilation
-    # docker (Engine 24+) with luxonis/modelconverter-rvc2 / -rvc4 images
-    #   for OAK / OAK4 — see docker/oak4-modelconverter.Dockerfile to build
-    #   the RVC4 image locally (SNPE SDK is licence-gated).
+    # docker (Engine 24+) with luxonis/modelconverter-rvc2:local /
+    #   -rvc4:local images for OAK / OAK4 — build both from scratch with
+    #   docker/oak/build.sh (requires user-supplied OpenVINO + SNPE archives,
+    #   see docker/oak/extra_packages/README.md).
 
 VisDrone classes (10):
     pedestrian, people, bicycle, car, van, truck,
@@ -789,16 +790,17 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--oak-rvc2-image", type=str,
-        default="luxonis/modelconverter-rvc2:latest",
+        default="luxonis/modelconverter-rvc2:local",
         help="Docker image tag for the RVC2 (OAK) converter "
-             "(default: luxonis/modelconverter-rvc2:latest)"
+             "(default: luxonis/modelconverter-rvc2:local — built from "
+             "scratch by docker/oak/build.sh)"
     )
     p.add_argument(
         "--oak-rvc4-image", type=str,
-        default="luxonis/modelconverter-rvc4:latest",
-        help="Docker image tag for the RVC4 (OAK4) converter. The official "
-             "image is not on Docker Hub — build it locally via "
-             "docker/oak4-modelconverter.Dockerfile."
+        default="luxonis/modelconverter-rvc4:local",
+        help="Docker image tag for the RVC4 (OAK4) converter "
+             "(default: luxonis/modelconverter-rvc4:local — built from "
+             "scratch by docker/oak/build.sh)"
     )
     p.add_argument(
         "--oak-calib-dir", type=str, default=None,

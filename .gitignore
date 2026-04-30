@@ -18,9 +18,12 @@ export/
 *.superblob
 *.dlc
 
-# Qualcomm SNPE SDK drop-in for the OAK4 Dockerfile (licence-gated;
-# users supply locally — see docker/oak4-modelconverter.Dockerfile).
-docker/snpe/
+# OAK / OAK4 local Docker build artefacts
+# - extra_packages/ holds licence-gated SDK archives users supply locally
+#   (see docker/oak/extra_packages/README.md)
+# - build/ is the working clone of luxonis/modelconverter created by
+#   docker/oak/build.sh
+docker/oak/build/
 
 # IDE
 .vscode/

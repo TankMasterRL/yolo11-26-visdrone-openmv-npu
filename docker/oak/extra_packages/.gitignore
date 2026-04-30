@@ -1,0 +1,4 @@
+# Licence-gated SDK archives — never commit these.
+*.tar.gz
+*.tgz
+*.zip
