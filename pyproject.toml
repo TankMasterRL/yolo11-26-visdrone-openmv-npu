@@ -12,7 +12,7 @@ dependencies = [
     # (PR ultralytics/ultralytics#23946) which is what lets us drive
     # ``model.tune(use_ray=True, search_alg=OptunaSearch(...))`` from
     # ``tune_hyperparameters.py`` without a custom ``tune.Tuner`` wrapper.
-    "ultralytics>=8.4.46",
+    "ultralytics>=8.4.50",
 ]
 
 [project.optional-dependencies]
@@ -22,8 +22,8 @@ ae3 = [
 ]
 # Hyperparameter tuning with Ray Tune + Optuna + TensorBoard visualisation
 tune = [
-    "ray[tune]>=2.44.0",
-    "optuna>=4.7.0",
+    "ray[tune]>=2.55.1",
+    "optuna>=4.8.0",
     "tensorboard>=2.20.0",
 ]
 # Full TFLite INT8 export dependency chain required by train_and_export.py
@@ -39,28 +39,28 @@ export = [
     # onnx >=1.21.0: Python 3.14 stable-ABI wheels available since 1.20.
     "onnx>=1.21.0,<2.0.0",
     "onnx2tf>=2.4.0,<3.0.0",
-    "onnxslim>=0.1.92",
+    "onnxslim>=0.1.93",
     "onnxruntime",
     "sng4onnx>=2.0.1",
-    "onnx_graphsurgeon>=0.5.0",
+    "onnx_graphsurgeon>=0.6.1",
     "ai-edge-litert>=2.1.4",
     "protobuf>=7.34.1,<8.0.0",
 ]
 # Convenience group for everything installable via pip
 all = [
-    "ultralytics>=8.4.46",
+    "ultralytics>=8.4.50",
     "ethos-u-vela>=5.0.0",
-    "ray[tune]>=2.44.0",
-    "optuna>=4.7.0",
+    "ray[tune]>=2.55.1",
+    "optuna>=4.8.0",
     "tensorboard>=2.20.0",
     "tensorflow>=2.21.0",
     "tf_keras<=2.21.0",
     "onnx>=1.21.0,<2.0.0",
     "onnx2tf>=2.4.0,<3.0.0",
-    "onnxslim>=0.1.92",
+    "onnxslim>=0.1.93",
     "onnxruntime",
     "sng4onnx>=2.0.1",
-    "onnx_graphsurgeon>=0.5.0",
+    "onnx_graphsurgeon>=0.6.1",
     "ai-edge-litert>=2.1.4",
     "protobuf>=7.34.1,<8.0.0",
 ]
