@@ -12,7 +12,7 @@ dependencies = [
     # (PR ultralytics/ultralytics#23946) which is what lets us drive
     # ``model.tune(use_ray=True, search_alg=OptunaSearch(...))`` from
     # ``tune_hyperparameters.py`` without a custom ``tune.Tuner`` wrapper.
-    "ultralytics>=8.4.50",
+    "ultralytics>=8.4.52",
 ]
 
 [project.optional-dependencies]
@@ -43,12 +43,12 @@ export = [
     "onnxruntime",
     "sng4onnx>=2.0.1",
     "onnx_graphsurgeon>=0.6.1",
-    "ai-edge-litert>=2.1.4",
-    "protobuf>=7.34.1,<8.0.0",
+    "ai-edge-litert>=2.1.5",
+    "protobuf>=7.35.0,<8.0.0",
 ]
 # Convenience group for everything installable via pip
 all = [
-    "ultralytics>=8.4.50",
+    "ultralytics>=8.4.52",
     "ethos-u-vela>=5.0.0",
     "ray[tune]>=2.55.1",
     "optuna>=4.8.0",
@@ -61,8 +61,8 @@ all = [
     "onnxruntime",
     "sng4onnx>=2.0.1",
     "onnx_graphsurgeon>=0.6.1",
-    "ai-edge-litert>=2.1.4",
-    "protobuf>=7.34.1,<8.0.0",
+    "ai-edge-litert>=2.1.5",
+    "protobuf>=7.35.0,<8.0.0",
 ]
 
 [tool.uv]
