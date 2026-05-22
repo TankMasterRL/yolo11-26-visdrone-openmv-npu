@@ -43,7 +43,7 @@ export = [
     "onnxruntime",
     "sng4onnx>=2.0.1",
     "onnx_graphsurgeon>=0.6.1",
-    "ai-edge-litert>=2.1.5",
+    "ai-edge-litert>=2.1.4",
     "protobuf>=7.35.0,<8.0.0",
 ]
 # Convenience group for everything installable via pip
@@ -61,7 +61,7 @@ all = [
     "onnxruntime",
     "sng4onnx>=2.0.1",
     "onnx_graphsurgeon>=0.6.1",
-    "ai-edge-litert>=2.1.5",
+    "ai-edge-litert>=2.1.4",
     "protobuf>=7.35.0,<8.0.0",
 ]
 
