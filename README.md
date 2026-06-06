@@ -222,7 +222,7 @@ rebuild on a different day or host yields the same installed software:
 |---|---|---|
 | `ULTRALYTICS_TAG` + `ULTRALYTICS_DIGEST` | `8.4.41` + sha256 | Base image — tag is the human-readable label, digest is authoritative |
 | `UV_TAG` | `0.11.7` | The `uv` binary copied from `ghcr.io/astral-sh/uv` |
-| `UV_EXCLUDE_NEWER` | `2026-04-23` | PyPI snapshot cutoff — `uv pip install --exclude-newer=<date>` caps resolution to releases on or before that date so `>=`-style constraints in `pyproject.toml` don't drift |
+| `UV_EXCLUDE_NEWER` | `2026-06-06` | PyPI snapshot cutoff — `uv pip install --exclude-newer=<date>` caps resolution to releases on or before that date so `>=`-style constraints in `pyproject.toml` don't drift. Must be ≥ the newest pinned floor's release date, so bump it alongside any dependency-floor raise |
 
 To refresh the snapshot, override all three together:
 
@@ -231,7 +231,7 @@ docker compose build \
     --build-arg ULTRALYTICS_TAG=8.4.42 \
     --build-arg ULTRALYTICS_DIGEST=sha256:<new-digest> \
     --build-arg UV_TAG=0.11.8 \
-    --build-arg UV_EXCLUDE_NEWER=2026-05-01
+    --build-arg UV_EXCLUDE_NEWER=2026-07-01
 ```
 
 ### Cloud notebooks (Colab / Paperspace / Kaggle)

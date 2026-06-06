@@ -24,27 +24,40 @@ ae3 = [
 tune = [
     "ray[tune]>=2.55.1",
     "optuna>=4.8.0",
-    "tensorboard>=2.20.0",
+    # Floor kept at 2.19 (not 2.20): the export extra pins tensorflow<=2.19.0,
+    # which requires tensorboard~=2.19.0, so a >=2.20 floor makes the combined
+    # ``--extra all`` install unsatisfiable. Tune-only installs still resolve
+    # to the latest 2.x.
+    "tensorboard>=2.19.0",
 ]
-# Full TFLite INT8 export dependency chain required by train_and_export.py
-# (Ultralytics would lazy-install these, but pinning keeps builds
-# reproducible and aligns with the Docker image).
+# Full TFLite INT8 export dependency chain required by train_and_export.py.
+# These versions MUST stay inside the ranges Ultralytics' own TFLite export
+# pins via check_requirements() in
+# ``ultralytics/utils/export/tensorflow.py::onnx2saved_model``. If they drift
+# above those ceilings Ultralytics silently re-installs/downgrades them at
+# export time, and (worse) ``uv pip install --extra all`` — host *and* the
+# Docker image — becomes unsatisfiable. As of ultralytics 8.4.56 the
+# export-critical caps are tensorflow<=2.19.0, tf_keras<=2.19.0,
+# onnx2tf>=1.26.3,<1.29.0, onnx<2.0.0 and protobuf>=5. Do NOT bump these to
+# "latest": TF>=2.20 requires protobuf>=5.28/6.31 (incompatible with the
+# rest of the chain) and the onnx2tf 2.x line hard-pins a conflicting
+# numpy/protobuf/ai-edge-litert set.
 # See https://docs.ultralytics.com/integrations/tflite/
 export = [
-    # TF 2.21: TensorBoard removed from TF's own deps (already pinned
-    # separately in the tune extra). tf.lite.Interpreter deleted in 2.20;
-    # ai-edge-litert carries the replacement.
-    "tensorflow>=2.21.0",
-    "tf_keras<=2.21.0",
-    # onnx >=1.21.0: Python 3.14 stable-ABI wheels available since 1.20.
+    # tensorflow<=2.19.0 is the newest line Ultralytics' exporter supports.
+    # It pulls a compatible tensorboard~=2.19.0 (mirrored in the tune extra
+    # below) and accepts protobuf 5.x (<6).
+    "tensorflow>=2.0.0,<=2.19.0",
+    "tf_keras<=2.19.0",
+    # onnx2tf consumes this ONNX; <2.0.0 keeps the IR within its support.
     "onnx>=1.21.0,<2.0.0",
-    "onnx2tf>=2.4.0,<3.0.0",
+    "onnx2tf>=1.26.3,<1.29.0",
     "onnxslim>=0.1.94",
     "onnxruntime",
     "sng4onnx>=2.0.1",
     "onnx_graphsurgeon>=0.6.1",
     "ai-edge-litert>=2.1.5",
-    "protobuf>=7.35.0,<8.0.0",
+    "protobuf>=5.0.0,<6.0.0",
 ]
 # Convenience group for everything installable via pip
 all = [
@@ -52,17 +65,17 @@ all = [
     "ethos-u-vela>=5.0.0",
     "ray[tune]>=2.55.1",
     "optuna>=4.8.0",
-    "tensorboard>=2.20.0",
-    "tensorflow>=2.21.0",
-    "tf_keras<=2.21.0",
+    "tensorboard>=2.19.0",
+    "tensorflow>=2.0.0,<=2.19.0",
+    "tf_keras<=2.19.0",
     "onnx>=1.21.0,<2.0.0",
-    "onnx2tf>=2.4.0,<3.0.0",
+    "onnx2tf>=1.26.3,<1.29.0",
     "onnxslim>=0.1.94",
     "onnxruntime",
     "sng4onnx>=2.0.1",
     "onnx_graphsurgeon>=0.6.1",
     "ai-edge-litert>=2.1.5",
-    "protobuf>=7.35.0,<8.0.0",
+    "protobuf>=5.0.0,<6.0.0",
 ]
 
 [tool.uv]
