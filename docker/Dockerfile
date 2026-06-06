@@ -45,7 +45,7 @@
 #         --build-arg ULTRALYTICS_TAG=8.4.42 \
 #         --build-arg ULTRALYTICS_DIGEST=sha256:<new-digest> \
 #         --build-arg UV_TAG=0.11.8 \
-#         --build-arg UV_EXCLUDE_NEWER=2026-05-01 \
+#         --build-arg UV_EXCLUDE_NEWER=2026-07-01 \
 #         -f docker/Dockerfile -t yolo11-26-visdrone-openmv:gpu .
 #
 # When bumping defaults, update all three together so the pinned state
@@ -103,7 +103,12 @@ ENV UV_LINK_MODE=copy \
     UV_NO_CACHE=1 \
     UV_SYSTEM_PYTHON=1
 
-ARG UV_EXCLUDE_NEWER=2026-04-23
+# This date MUST be >= the publish date of the newest pinned floor in
+# pyproject.toml (e.g. ultralytics 8.4.56 landed 2026-05-27, ai-edge-litert
+# 2.1.5 on 2026-05-15). An older snapshot caps resolution below those floors
+# and makes the constraint set unsatisfiable, so bump this whenever a
+# dependency lower bound is raised.
+ARG UV_EXCLUDE_NEWER=2026-06-06
 ENV UV_EXCLUDE_NEWER=${UV_EXCLUDE_NEWER}
 
 COPY pyproject.toml /tmp/pyproject.toml
