@@ -27,6 +27,7 @@ VisDrone classes (10):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -278,6 +279,41 @@ def enable_gpu_fast_path() -> None:
         pass
 
 
+@contextlib.contextmanager
+def tensorflow_cpu_export():
+    """
+    Hide CUDA devices from TensorFlow for the duration of the ``with`` block
+    so the TFLite export runs on the CPU.
+
+    The INT8 TFLite export chain (PyTorch → ONNX → ``onnx2tf`` → TF
+    SavedModel → TFLite) imports TensorFlow lazily inside
+    ``model.export()``. TensorFlow grabs the first visible CUDA device on
+    import and runs the ``onnx2tf`` conversion ops (e.g. ``tf.cast``) on it.
+    On a GPU whose compute capability is newer than the kernels bundled
+    with the installed TF build — e.g. an RTX 5090 (Blackwell, sm_120)
+    under TensorFlow 2.19 — those kernels are absent, TF falls back to
+    JIT-compiling from PTX, and the kernel launch fails outright with
+    ``CUDA_ERROR_INVALID_HANDLE`` on ``[Op:Cast]``, aborting the export.
+
+    The conversion is a graph transform plus INT8 calibration over a
+    handful of ≤320 px images, so the CPU path is both correct and fast —
+    the GPU offers no benefit here even when it works (TF otherwise warns
+    that the PTX JIT "could take 30 minutes or longer"). We set
+    ``CUDA_VISIBLE_DEVICES=-1`` for the export and restore the previous
+    value on exit so the surrounding PyTorch training in the same process
+    (the multi-model loop) keeps using the GPU.
+    """
+    saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = saved
+
+
 def run_cmd(cmd: list[str], cwd: str | None = None) -> int:
     """Run a subprocess, stream stdout/stderr, return exit code."""
     print(f"  → {' '.join(cmd)}")
@@ -363,7 +399,15 @@ def export_tflite_int8(
     export_args = {**DEFAULT_EXPORT_ARGS}
     export_args["imgsz"] = imgsz_export
 
-    result_path = model.export(**export_args)
+    # Run the export with CUDA hidden from TensorFlow. The onnx2tf
+    # conversion otherwise grabs the GPU and crashes on architectures
+    # newer than the TF build's bundled CUDA kernels (e.g. an RTX 5090,
+    # sm_120, under TF 2.19) — see ``tensorflow_cpu_export``. The export
+    # is CPU-appropriate work, so this is a correctness fix and a no-op on
+    # GPUs where TF would otherwise have worked.
+    print("  Forcing TensorFlow onto CPU for export (CUDA_VISIBLE_DEVICES=-1)")
+    with tensorflow_cpu_export():
+        result_path = model.export(**export_args)
 
     # Ultralytics places the tflite alongside best.pt or in a _saved_model dir
     result_path = Path(result_path)
