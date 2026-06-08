@@ -264,19 +264,24 @@ declines them.
 5. **`runs/`, `export/`, `*.pt`, `*.tflite`, `*.onnx` are gitignored.**
    Don't commit training artefacts or weights.
 
-6. **TFLite export must run on CPU — TensorFlow crashes on too-new
-   GPUs.** The `onnx2tf` step of `export_tflite_int8` imports TensorFlow,
-   which grabs the first visible CUDA device. If the GPU's compute
-   capability is newer than the kernels bundled with the installed TF
-   build (e.g. an RTX 5090 / Blackwell `sm_120` under TF 2.19), TF tries
-   to JIT from PTX and the kernel launch dies with
-   `CUDA_ERROR_INVALID_HANDLE` on `[Op:Cast]`. The fix is the
-   `tensorflow_cpu_export()` context manager: it sets
-   `CUDA_VISIBLE_DEVICES=-1` around `model.export(...)` and restores it
-   after, so TF runs the (CPU-appropriate) conversion on the CPU while
-   the multi-model training loop keeps the GPU. Do **not** "fix" this by
-   bumping TensorFlow or downgrading the GPU — the export never needed
-   the GPU. Keep the export inside the context manager.
+6. **TFLite export must run in a GPU-free subprocess — TensorFlow
+   crashes on too-new GPUs.** The `onnx2tf` step of `export_tflite_int8`
+   imports TensorFlow, which grabs the first visible CUDA device. If the
+   GPU's compute capability is newer than the kernels bundled with the
+   installed TF build (e.g. an RTX 5090 / Blackwell `sm_120` under
+   TF 2.19), TF JIT-compiles from PTX and the kernel launch dies with
+   `CUDA_ERROR_INVALID_HANDLE` on `[Op:Cast]`. Setting
+   `CUDA_VISIBLE_DEVICES=-1` **in-process does not help**: the CUDA driver
+   only reads it at the first `cuInit()`, and training has already
+   initialised CUDA via PyTorch by then, so the change is ignored by
+   every library in the process (TF included). The fix is
+   `run_export_isolated`, which runs the export in a fresh subprocess with
+   `CUDA_VISIBLE_DEVICES=-1` set *before* the interpreter starts — that
+   child's `cuInit()` honours it, hiding the GPU from both PyTorch and TF
+   so the (CPU-appropriate) conversion runs on the CPU while the parent
+   training loop keeps the GPU. Do **not** "fix" this by bumping
+   TensorFlow, downgrading the GPU, or moving the export back in-process —
+   the export never needed the GPU.
 
 ## When in doubt
 

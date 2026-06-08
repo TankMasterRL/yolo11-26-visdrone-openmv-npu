@@ -751,10 +751,11 @@ postprocessor handles NMS in MicroPython). Verify `MIN_SCORE` isn't too high.
 On GPUs newer than the installed TensorFlow build's bundled CUDA kernels
 (e.g. an RTX 5090 / Blackwell `sm_120` under TensorFlow 2.19), the
 `onnx2tf` conversion step grabs the GPU and the kernel launch fails. The
-export runs the conversion on the CPU automatically
-(`CUDA_VISIBLE_DEVICES=-1` is scoped around it) — training still uses the
-GPU. If you see this error, make sure you're on a build that includes the
-CPU-export fix; the conversion is CPU work and does not need the GPU.
+pipeline runs the export in an isolated subprocess with the GPU hidden
+(`CUDA_VISIBLE_DEVICES=-1` set before that process starts), so the
+conversion runs on the CPU while training still uses the GPU. The
+conversion is CPU work and does not need the GPU; if you still hit this
+error, make sure you're on a build that includes the isolated-export fix.
 
 **Vela compilation fails:**
 Ensure the model is fully INT8 quantised (including inputs/outputs).
