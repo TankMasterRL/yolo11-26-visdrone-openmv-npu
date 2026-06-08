@@ -354,7 +354,14 @@ def export_tflite_int8(
     imgsz_export: int,
     output_dir: Path,
 ) -> Path:
-    """Export trained model to INT8 TFLite. Returns path to .tflite file."""
+    """Export trained model to INT8 TFLite. Returns path to .tflite file.
+
+    Imports and initialises TensorFlow (via Ultralytics' onnx2tf chain),
+    so it MUST run in a process where the GPU is hidden. Drive it through
+    ``run_export_isolated`` rather than calling it directly — see that
+    wrapper for why an in-process ``CUDA_VISIBLE_DEVICES`` tweak is too
+    late once training has initialised CUDA.
+    """
     from ultralytics import YOLO
 
     log(f"EXPORTING {model_name} → TFLite INT8 (imgsz={imgsz_export})")
@@ -373,6 +380,76 @@ def export_tflite_int8(
     dst = output_dir / f"{model_name}_int8.tflite"
     shutil.copy2(result_path, dst)
     print(f"  ✓ TFLite INT8: {dst}  ({dst.stat().st_size / 1024:.0f} KB)")
+    return dst
+
+
+def run_export_isolated(
+    best_pt: Path,
+    model_name: str,
+    imgsz_export: int,
+    output_dir: Path,
+) -> Path:
+    """Run ``export_tflite_int8`` in a subprocess with the GPU hidden.
+
+    Why a subprocess instead of just setting ``CUDA_VISIBLE_DEVICES=-1``
+    in-process: TensorFlow grabs the first CUDA device when its context
+    initialises, and the ``onnx2tf`` step of the export then runs ops
+    (e.g. ``tf.cast``) on it. On a GPU newer than the kernels bundled with
+    the installed TF build — an RTX 5090 (Blackwell, ``sm_120``) under
+    TensorFlow 2.19 — those kernels are absent, so TF JIT-compiles from
+    PTX and the launch dies with ``CUDA_ERROR_INVALID_HANDLE`` on
+    ``[Op:Cast]``.
+
+    ``CUDA_VISIBLE_DEVICES`` is only consulted by the CUDA driver at the
+    first ``cuInit()`` of a process. By export time the pipeline has
+    already trained on the GPU, so PyTorch initialised the driver and the
+    variable is frozen — flipping it afterwards is ignored by every
+    library in the process, TensorFlow included (an earlier in-process
+    attempt failed for exactly this reason). The only reliable fix is a
+    fresh process: we launch the export with ``CUDA_VISIBLE_DEVICES=-1``
+    set *before* the interpreter starts, so its ``cuInit()`` honours the
+    setting and neither PyTorch nor TensorFlow can see the GPU. The
+    conversion (graph transform + INT8 calibration on a ≤320 px model) is
+    CPU-appropriate, so running it GPU-free is both correct and fast.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # The child re-imports this module and calls export_tflite_int8 with
+    # absolute paths, so it is independent of its working directory. We
+    # keep the child's cwd inherited from the parent so the relative
+    # ``data=VisDrone.yaml`` calibration path resolves exactly as it does
+    # in the in-process path.
+    child_src = (
+        "import sys; from pathlib import Path; "
+        "import train_and_export as t; "
+        "t.export_tflite_int8(Path(sys.argv[1]), sys.argv[2], "
+        "int(sys.argv[3]), Path(sys.argv[4]))"
+    )
+    cmd = [
+        sys.executable, "-c", child_src,
+        str(best_pt.resolve()), model_name, str(imgsz_export),
+        str(output_dir.resolve()),
+    ]
+
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = "-1"  # honoured at the child's cuInit()
+    # Ensure this script is importable in the child regardless of cwd.
+    script_dir = str(Path(__file__).resolve().parent)
+    env["PYTHONPATH"] = (
+        script_dir + os.pathsep + env["PYTHONPATH"]
+        if env.get("PYTHONPATH") else script_dir
+    )
+
+    print("  Exporting in an isolated CPU process "
+          "(CUDA_VISIBLE_DEVICES=-1, GPU hidden from TensorFlow)")
+    rc = subprocess.run(cmd, env=env).returncode
+
+    dst = output_dir / f"{model_name}_int8.tflite"
+    if rc != 0 or not dst.exists():
+        raise RuntimeError(
+            f"TFLite export for {model_name} failed in the isolated "
+            f"export process (exit code {rc})."
+        )
     return dst
 
 
@@ -598,7 +675,7 @@ def main() -> None:
 
         # --- Export TFLite INT8 -------------------------------------------
         tflite_dir = output_root / "tflite"
-        tflite_path = export_tflite_int8(
+        tflite_path = run_export_isolated(
             best_pt, model_name, export_imgsz, tflite_dir
         )
 

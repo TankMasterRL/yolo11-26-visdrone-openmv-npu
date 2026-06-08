@@ -747,6 +747,16 @@ to 192. Use `load_to_fb=True` when loading the model.
 Check that `nms=False` was used during export (the `ultralytics.YOLO()`
 postprocessor handles NMS in MicroPython). Verify `MIN_SCORE` isn't too high.
 
+**TFLite export crashes with `CUDA_ERROR_INVALID_HANDLE` / `[Op:Cast]`:**
+On GPUs newer than the installed TensorFlow build's bundled CUDA kernels
+(e.g. an RTX 5090 / Blackwell `sm_120` under TensorFlow 2.19), the
+`onnx2tf` conversion step grabs the GPU and the kernel launch fails. The
+pipeline runs the export in an isolated subprocess with the GPU hidden
+(`CUDA_VISIBLE_DEVICES=-1` set before that process starts), so the
+conversion runs on the CPU while training still uses the GPU. The
+conversion is CPU work and does not need the GPU; if you still hit this
+error, make sure you're on a build that includes the isolated-export fix.
+
 **Vela compilation fails:**
 Ensure the model is fully INT8 quantised (including inputs/outputs).
 Run `vela --supported-ops-report` to check operator compatibility.
