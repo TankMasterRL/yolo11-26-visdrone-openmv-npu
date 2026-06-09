@@ -87,9 +87,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
-import traceback
+import time
 from pathlib import Path
+
+from pipeline_logging import setup_logging, shutdown_logging
+
+logger = logging.getLogger("tune_hyperparameters")
 
 # Models to tune: (friendly name → Ultralytics weights id).
 # Matches ALL_MODELS in train_and_export.py so downstream workflows
@@ -393,6 +398,12 @@ def parse_args() -> argparse.Namespace:
              "(default: visdrone_raytune)",
     )
     p.add_argument(
+        "--log-dir", default="logs",
+        help="Directory for the timestamped run log file (default: logs/). "
+             "Captures the driver output plus everything Ray streams back "
+             "from the trial workers, in order.",
+    )
+    p.add_argument(
         "--search-algo",
         choices=["optuna", "random"],
         default="optuna",
@@ -449,10 +460,10 @@ def _enable_gpu_fast_path() -> None:
     try:
         name = torch.cuda.get_device_name(0)
         free, total = torch.cuda.mem_get_info()
-        print(
-            f"  GPU fast path: {name}  "
-            f"({free / 1e9:.1f} / {total / 1e9:.1f} GB free) "
-            f"– cuDNN benchmark on, TF32 matmul on"
+        logger.info(
+            "  GPU fast path: %s  (%.1f / %.1f GB free) "
+            "– cuDNN benchmark on, TF32 matmul on",
+            name, free / 1e9, total / 1e9,
         )
     except Exception:
         pass
@@ -531,11 +542,10 @@ def tune_one_model(
         try:
             from ray.tune.search.optuna import OptunaSearch
         except ImportError:
-            print(
-                "ERROR: optuna is not installed; install it via\n"
+            logger.error(
+                "optuna is not installed; install it via\n"
                 "    uv sync --extra tune\n"
-                "or re-run with --search-algo random to use plain random search.",
-                file=sys.stderr,
+                "or re-run with --search-algo random to use plain random search."
             )
             return None
         points_to_evaluate = _recipe_seed_for(model_key, space)
@@ -566,11 +576,11 @@ def tune_one_model(
     # running on a beefy multi-GPU host where 60%/60% is fine.
     gpt = args.gpu_per_trial
     if gpt is not None and 0.0 < gpt < 1.0 and args.batch == -1:
-        print(
-            f"  ⚠  --gpu-per-trial={gpt} with --batch=-1 "
-            f"(AutoBatch 60%% mem): co-tenant trials may OOM. "
-            f"Consider --batch {round(0.5 * gpt, 2)} "
-            f"or a fixed integer batch."
+        logger.warning(
+            "  ⚠  --gpu-per-trial=%s with --batch=-1 "
+            "(AutoBatch 60%% mem): co-tenant trials may OOM. "
+            "Consider --batch %s or a fixed integer batch.",
+            gpt, round(0.5 * gpt, 2),
         )
 
     # ---- Training kwargs forwarded into every trial -------------------
@@ -594,17 +604,18 @@ def tune_one_model(
     if args.device is not None:
         train_kwargs["device"] = args.device
 
-    print("\n" + "=" * 72)
-    print(f" [{model_key}]  Ray Tune sweep → {exp_name}")
-    print("=" * 72)
-    print(f"  Weights      : {weights}")
-    print(f"  Iterations   : {args.iterations}")
-    print(f"  Epochs/trial : {args.epochs} (grace={args.grace_period})")
-    print(f"  Image size   : {args.imgsz}")
-    print(f"  GPU/trial    : {gpt if gpt is not None else 'auto'}")
-    print(f"  Batch        : {args.batch}")
-    print(f"  Cache / wkrs : {args.cache} / {args.workers}")
-    print(f"  Search algo  : {search_desc}")
+    logger.info("")
+    logger.info("=" * 72)
+    logger.info(" [%s]  Ray Tune sweep → %s", model_key, exp_name)
+    logger.info("=" * 72)
+    logger.info("  Weights      : %s", weights)
+    logger.info("  Iterations   : %s", args.iterations)
+    logger.info("  Epochs/trial : %s (grace=%s)", args.epochs, args.grace_period)
+    logger.info("  Image size   : %s", args.imgsz)
+    logger.info("  GPU/trial    : %s", gpt if gpt is not None else "auto")
+    logger.info("  Batch        : %s", args.batch)
+    logger.info("  Cache / wkrs : %s / %s", args.cache, args.workers)
+    logger.info("  Search algo  : %s", search_desc)
 
     # ---- Dispatch into Ultralytics' built-in Ray Tune integration -----
     try:
@@ -617,9 +628,8 @@ def tune_one_model(
             gpu_per_trial=gpt,
             **train_kwargs,
         )
-    except Exception as e:
-        print(f"  ✗ Tuning failed for {model_key}: {e}")
-        traceback.print_exc()
+    except Exception:
+        logger.exception("  ✗ Tuning failed for %s", model_key)
         return None
 
     # ---- Extract & persist best trial ---------------------------------
@@ -631,34 +641,34 @@ def tune_one_model(
         best_cfg = best_result.config
         best_metrics = best_result.metrics or {}
 
-        print(f"\n  Best trial config for {model_key}:")
+        logger.info("  Best trial config for %s:", model_key)
         for k, v in sorted(best_cfg.items()):
-            print(f"    {k:20s} = {v}")
+            logger.info("    %-20s = %s", k, v)
 
         map5095 = best_metrics.get(_METRIC_NAME)
         map50 = best_metrics.get("metrics/mAP50(B)")
         if map5095 is not None:
-            print(f"\n  mAP50-95 : {map5095:.4f}")
+            logger.info("  mAP50-95 : %.4f", map5095)
         if map50 is not None:
-            print(f"  mAP50    : {map50:.4f}")
+            logger.info("  mAP50    : %.4f", map50)
 
         best_cfg_path = output_dir / f"{exp_name}_best_hyperparameters.json"
         best_cfg_path.write_text(json.dumps(best_cfg, indent=2, default=str))
-        print(f"\n  Best hyperparameters saved to: {best_cfg_path}")
+        logger.info("  Best hyperparameters saved to: %s", best_cfg_path)
 
         summary["best_cfg_path"] = str(best_cfg_path)
         summary["mAP50-95"] = map5095
         summary["mAP50"] = map50
-    except Exception as e:
-        print(f"  Could not extract best trial for {model_key}: {e}")
-        print("  Inspect the ResultGrid manually via the saved Ray experiment.")
+    except Exception:
+        logger.warning(
+            "  Could not extract best trial for %s", model_key, exc_info=True
+        )
+        logger.warning("  Inspect the ResultGrid manually via the saved Ray experiment.")
 
     return summary
 
 
-def main() -> None:
-    args = parse_args()
-
+def _run(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     # Dependency checks – Ray Tune + TensorBoard are optional extras
     # ------------------------------------------------------------------
@@ -666,13 +676,12 @@ def main() -> None:
         import ray  # noqa: F401
         from ray import tune  # noqa: F401
     except ImportError:
-        print(
-            "ERROR: Ray Tune is not installed.\n"
+        logger.error(
+            "Ray Tune is not installed.\n"
             "Install the tuning extras with:\n"
             "    uv sync --extra tune\n"
             "or directly with pip:\n"
-            "    pip install 'ray[tune]' 'optuna>=3.4' tensorboard",
-            file=sys.stderr,
+            "    pip install 'ray[tune]' 'optuna>=3.4' tensorboard"
         )
         sys.exit(1)
 
@@ -683,22 +692,22 @@ def main() -> None:
     # Ray worker is spawned. Workers inherit the env so this propagates.
     _enable_gpu_fast_path()
 
-    print("=" * 72)
-    print(" Ray Tune × Ultralytics YOLO × VisDrone")
-    print("=" * 72)
-    print(f"  Models       : {', '.join(args.models)}")
-    print(f"  Data         : {args.data}")
-    print(f"  Iterations   : {args.iterations}  (per model)")
-    print(f"  Epochs/trial : {args.epochs} (grace={args.grace_period})")
-    print(f"  Image size   : {args.imgsz}")
-    print(f"  Batch        : {args.batch}")
-    print(f"  Cache / wkrs : {args.cache} / {args.workers}")
-    print(f"  GPU/trial    : {args.gpu_per_trial if args.gpu_per_trial else 'auto'}")
-    print(f"  Device       : {args.device or 'auto'}")
-    print(f"  Output       : {output_dir}")
-    print(f"  Search algo  : {args.search_algo}")
-    print(f"  Search space : VisDrone + model-family tuned")
-    print("=" * 72)
+    logger.info("=" * 72)
+    logger.info(" Ray Tune × Ultralytics YOLO × VisDrone")
+    logger.info("=" * 72)
+    logger.info("  Models       : %s", ", ".join(args.models))
+    logger.info("  Data         : %s", args.data)
+    logger.info("  Iterations   : %s  (per model)", args.iterations)
+    logger.info("  Epochs/trial : %s (grace=%s)", args.epochs, args.grace_period)
+    logger.info("  Image size   : %s", args.imgsz)
+    logger.info("  Batch        : %s", args.batch)
+    logger.info("  Cache / wkrs : %s / %s", args.cache, args.workers)
+    logger.info("  GPU/trial    : %s", args.gpu_per_trial if args.gpu_per_trial else "auto")
+    logger.info("  Device       : %s", args.device or "auto")
+    logger.info("  Output       : %s", output_dir)
+    logger.info("  Search algo  : %s", args.search_algo)
+    logger.info("  Search space : VisDrone + model-family tuned")
+    logger.info("=" * 72)
 
     # ------------------------------------------------------------------
     # Run one Ray Tune sweep per model.
@@ -715,38 +724,58 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Final summary table
     # ------------------------------------------------------------------
-    print("\n" + "=" * 72)
-    print(" TUNING COMPLETE")
-    print("=" * 72)
+    logger.info("")
+    logger.info("=" * 72)
+    logger.info(" TUNING COMPLETE")
+    logger.info("=" * 72)
     if summaries:
-        print(f"\n  {'Model':<10} {'mAP50-95':>10} {'mAP50':>10}  Best hyperparameters")
-        print("  " + "-" * 68)
+        logger.info("  %-10s %10s %10s  Best hyperparameters",
+                    "Model", "mAP50-95", "mAP50")
+        logger.info("  " + "-" * 68)
         for s in summaries:
             map5095 = s.get("mAP50-95")
             map50 = s.get("mAP50")
             map5095_str = f"{map5095:.4f}" if map5095 is not None else "   -  "
             map50_str = f"{map50:.4f}" if map50 is not None else "   -  "
             cfg_path = s.get("best_cfg_path", "(unavailable)")
-            print(f"  {s['model']:<10} {map5095_str:>10} {map50_str:>10}  {cfg_path}")
+            logger.info("  %-10s %10s %10s  %s",
+                        s["model"], map5095_str, map50_str, cfg_path)
     else:
-        print("\n  No successful tuning runs – see errors above.")
+        logger.info("  No successful tuning runs – see errors above.")
 
     # ------------------------------------------------------------------
     # TensorBoard instructions
     # ------------------------------------------------------------------
-    print("\n" + "-" * 72)
-    print(" TensorBoard")
-    print("-" * 72)
-    print("  Ultralytics writes TFEvent logs for every trial of every model.")
-    print("  Compare all sweeps in one UI with:")
-    print(f"    uv run tensorboard --logdir {output_dir}")
-    print("  Or view Ray Tune's own metrics (default ~/ray_results):")
-    print("    uv run tensorboard --logdir ~/ray_results")
-    print(
+    logger.info("")
+    logger.info("-" * 72)
+    logger.info(" TensorBoard")
+    logger.info("-" * 72)
+    logger.info("  Ultralytics writes TFEvent logs for every trial of every model.")
+    logger.info("  Compare all sweeps in one UI with:")
+    logger.info("    uv run tensorboard --logdir %s", output_dir)
+    logger.info("  Or view Ray Tune's own metrics (default ~/ray_results):")
+    logger.info("    uv run tensorboard --logdir ~/ray_results")
+    logger.info(
         "\n  Next step – re-train each model with its best hyperparameters\n"
         "  by passing the *_best_hyperparameters.json values into\n"
         "  train_and_export.py.\n"
     )
+
+
+def main() -> None:
+    args = parse_args()
+    _, log_path = setup_logging("tune_hyperparameters", log_dir=args.log_dir)
+    run_t0 = time.perf_counter()
+    try:
+        _run(args)
+    except Exception:
+        logger.exception("✗ Tuning aborted by an unhandled exception")
+        raise
+    finally:
+        logger.info("Total tuning wall time: %.1fs",
+                    time.perf_counter() - run_t0)
+        logger.info("Full log written to %s", log_path)
+        shutdown_logging()
 
 
 if __name__ == "__main__":

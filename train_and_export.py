@@ -28,11 +28,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import shutil
-import subprocess
 import sys
+import time
 from pathlib import Path
+
+from pipeline_logging import setup_logging, shutdown_logging, stream_subprocess
+
+logger = logging.getLogger("train_and_export")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -201,7 +206,10 @@ MODEL_TRAIN_OVERRIDES: dict[str, dict] = {
 # ---------------------------------------------------------------------------
 
 def log(msg: str) -> None:
-    print(f"\n{'='*72}\n  {msg}\n{'='*72}\n")
+    logger.info("")
+    logger.info("=" * 72)
+    logger.info("  %s", msg)
+    logger.info("=" * 72)
 
 
 def which(tool: str) -> str | None:
@@ -269,20 +277,23 @@ def enable_gpu_fast_path() -> None:
     try:
         name = torch.cuda.get_device_name(0)
         free, total = torch.cuda.mem_get_info()
-        print(
-            f"  GPU fast path: {name}  "
-            f"({free / 1e9:.1f} / {total / 1e9:.1f} GB free) "
-            f"– cuDNN benchmark on, TF32 matmul on"
+        logger.info(
+            "  GPU fast path: %s  (%.1f / %.1f GB free) "
+            "– cuDNN benchmark on, TF32 matmul on",
+            name, free / 1e9, total / 1e9,
         )
     except Exception:
         pass
 
 
-def run_cmd(cmd: list[str], cwd: str | None = None) -> int:
-    """Run a subprocess, stream stdout/stderr, return exit code."""
-    print(f"  → {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=cwd)
-    return result.returncode
+def run_cmd(cmd: list[str], cwd: str | None = None, *, tag: str = "cmd") -> int:
+    """Run a subprocess, relaying its output into the unified log.
+
+    Output is captured and re-emitted line-by-line through the module
+    logger (tagged with ``tag``) so it is timestamped and sequentially
+    integrated with the main process's log — see ``pipeline_logging``.
+    """
+    return stream_subprocess(cmd, logger=logger, tag=tag, cwd=cwd)
 
 
 # ---------------------------------------------------------------------------
@@ -314,8 +325,10 @@ def train_model(
     train_args = {**DEFAULT_TRAIN_ARGS}
     overrides = MODEL_TRAIN_OVERRIDES.get(model_name)
     if overrides:
-        print(f"  Applying {model_name} training recipe overrides "
-              f"({len(overrides)} hyperparameters)")
+        logger.info(
+            "  Applying %s training recipe overrides (%d hyperparameters)",
+            model_name, len(overrides),
+        )
         train_args.update(overrides)
 
     train_args["imgsz"] = imgsz
@@ -331,16 +344,18 @@ def train_model(
     if device is not None:
         train_args["device"] = device
 
-    print(
-        f"  Runtime: batch={batch}  cache={cache}  workers={workers}  "
-        f"device={device or 'auto'}"
+    logger.info(
+        "  Runtime: batch=%s  cache=%s  workers=%s  device=%s",
+        batch, cache, workers, device or "auto",
     )
 
+    t0 = time.perf_counter()
     model.train(**train_args)
+    logger.info("  ✓ Training completed in %.1fs", time.perf_counter() - t0)
 
     best_pt = project_dir / model_name / "weights" / "best.pt"
     assert best_pt.exists(), f"Training failed – {best_pt} not found"
-    print(f"  ✓ Best weights: {best_pt}")
+    logger.info("  ✓ Best weights: %s", best_pt)
     return best_pt
 
 
@@ -370,7 +385,9 @@ def export_tflite_int8(
     export_args = {**DEFAULT_EXPORT_ARGS}
     export_args["imgsz"] = imgsz_export
 
+    t0 = time.perf_counter()
     result_path = model.export(**export_args)
+    logger.info("  Conversion finished in %.1fs", time.perf_counter() - t0)
 
     # Ultralytics places the tflite alongside best.pt or in a _saved_model dir
     result_path = Path(result_path)
@@ -379,7 +396,7 @@ def export_tflite_int8(
     output_dir.mkdir(parents=True, exist_ok=True)
     dst = output_dir / f"{model_name}_int8.tflite"
     shutil.copy2(result_path, dst)
-    print(f"  ✓ TFLite INT8: {dst}  ({dst.stat().st_size / 1024:.0f} KB)")
+    logger.info("  ✓ TFLite INT8: %s  (%.0f KB)", dst, dst.stat().st_size / 1024)
     return dst
 
 
@@ -421,6 +438,8 @@ def run_export_isolated(
     # in the in-process path.
     child_src = (
         "import sys; from pathlib import Path; "
+        "import pipeline_logging; "
+        "pipeline_logging.setup_child_logging('train_and_export'); "
         "import train_and_export as t; "
         "t.export_tflite_int8(Path(sys.argv[1]), sys.argv[2], "
         "int(sys.argv[3]), Path(sys.argv[4]))"
@@ -440,9 +459,11 @@ def run_export_isolated(
         if env.get("PYTHONPATH") else script_dir
     )
 
-    print("  Exporting in an isolated CPU process "
-          "(CUDA_VISIBLE_DEVICES=-1, GPU hidden from TensorFlow)")
-    rc = subprocess.run(cmd, env=env).returncode
+    logger.info(
+        "  Exporting in an isolated CPU process "
+        "(CUDA_VISIBLE_DEVICES=-1, GPU hidden from TensorFlow)"
+    )
+    rc = stream_subprocess(cmd, logger=logger, tag=f"export:{model_name}", env=env)
 
     dst = output_dir / f"{model_name}_int8.tflite"
     if rc != 0 or not dst.exists():
@@ -462,8 +483,8 @@ def compile_vela(tflite_path: Path, model_name: str, output_dir: Path) -> Path |
     log(f"COMPILING {model_name} with Vela for OpenMV AE3 (Ethos-U55)")
 
     if not which("vela"):
-        print("  ⚠  'vela' not found on PATH – install with: pip install ethos-u-vela")
-        print("     Skipping AE3 NPU compilation.")
+        logger.warning("  ⚠  'vela' not found on PATH – install with: pip install ethos-u-vela")
+        logger.warning("     Skipping AE3 NPU compilation.")
         return None
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -474,23 +495,23 @@ def compile_vela(tflite_path: Path, model_name: str, output_dir: Path) -> Path |
         "--output-dir", str(output_dir),
         *BOARDS["ae3"]["vela_args"],
     ]
-    rc = run_cmd(cmd)
+    rc = run_cmd(cmd, tag="vela")
     if rc != 0:
-        print(f"  ✗ Vela compilation failed (exit {rc})")
+        logger.error("  ✗ Vela compilation failed (exit %d)", rc)
         return None
 
     # Vela output name: <stem>_vela.tflite
     vela_out = output_dir / f"{tflite_path.stem}_vela.tflite"
     if vela_out.exists():
-        print(f"  ✓ Vela model: {vela_out}  ({vela_out.stat().st_size / 1024:.0f} KB)")
+        logger.info("  ✓ Vela model: %s  (%.0f KB)", vela_out, vela_out.stat().st_size / 1024)
         return vela_out
 
     # Try alternative naming
     for f in output_dir.glob("*.tflite"):
-        print(f"  ✓ Vela model: {f}  ({f.stat().st_size / 1024:.0f} KB)")
+        logger.info("  ✓ Vela model: %s  (%.0f KB)", f, f.stat().st_size / 1024)
         return f
 
-    print("  ✗ No Vela output found")
+    logger.error("  ✗ No Vela output found")
     return None
 
 
@@ -506,10 +527,10 @@ def compile_stedgeai(
 
     stedgeai_bin = which("stedgeai") or which("stedgeai.exe")
     if not stedgeai_bin:
-        print("  ⚠  'stedgeai' not found on PATH.")
-        print("     Install STM32Cube.AI / X-CUBE-AI and add Utilities/ to PATH.")
-        print("     Skipping N6 NPU compilation – the INT8 TFLite can still be")
-        print("     loaded directly by OpenMV N6 firmware (with CPU fallback).")
+        logger.warning("  ⚠  'stedgeai' not found on PATH.")
+        logger.warning("     Install STM32Cube.AI / X-CUBE-AI and add Utilities/ to PATH.")
+        logger.warning("     Skipping N6 NPU compilation – the INT8 TFLite can still be")
+        logger.warning("     loaded directly by OpenMV N6 firmware (with CPU fallback).")
         return None
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -535,9 +556,9 @@ def compile_stedgeai(
         "--st-neural-art", f"default@{cfg_path}",
         *BOARDS["n6"]["stedgeai_args"],
     ]
-    rc = run_cmd(cmd, cwd=str(output_dir))
+    rc = run_cmd(cmd, cwd=str(output_dir), tag="stedgeai")
     if rc != 0:
-        print(f"  ✗ STEdgeAI compilation failed (exit {rc})")
+        logger.error("  ✗ STEdgeAI compilation failed (exit %d)", rc)
         return None
 
     # stedgeai outputs to st_ai_output/ with .raw network binary + .h headers
@@ -545,11 +566,11 @@ def compile_stedgeai(
     if st_out.exists():
         raw_files = list(st_out.glob("*.raw"))
         if raw_files:
-            print(f"  ✓ Neural-ART binary: {raw_files[0]}")
+            logger.info("  ✓ Neural-ART binary: %s", raw_files[0])
             return raw_files[0]
 
-    print("  ℹ  No .raw binary found – the INT8 TFLite will still work on")
-    print("     OpenMV N6 (firmware handles NPU acceleration automatically).")
+    logger.info("  ℹ  No .raw binary found – the INT8 TFLite will still work on")
+    logger.info("     OpenMV N6 (firmware handles NPU acceleration automatically).")
     return None
 
 
@@ -561,7 +582,7 @@ def write_labels(output_dir: Path) -> Path:
     """Write VisDrone labels.txt for OpenMV."""
     labels_path = output_dir / "labels.txt"
     labels_path.write_text("\n".join(VISDRONE_CLASSES) + "\n")
-    print(f"  ✓ Labels: {labels_path}")
+    logger.info("  ✓ Labels: %s", labels_path)
     return labels_path
 
 
@@ -621,11 +642,16 @@ def parse_args() -> argparse.Namespace:
         "--output", type=str, default="export",
         help="Root output directory for exported models"
     )
+    p.add_argument(
+        "--log-dir", type=str, default="logs",
+        help="Directory for the timestamped run log file (default: logs/). "
+             "Subprocess output (export / Vela / STEdgeAI) is captured into "
+             "the same file, in order."
+    )
     return p.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def _run_pipeline(args: argparse.Namespace) -> None:
     project_dir = Path(args.project)
     output_root = Path(args.output)
 
@@ -637,11 +663,11 @@ def main() -> None:
         return 256 if model_name.endswith("n") else 320
 
     log("YOLO × VisDrone → OpenMV NPU Pipeline")
-    print(f"  Models : {', '.join(args.models)}")
-    print(f"  Epochs : {args.epochs}")
-    print(f"  Train sz: {args.imgsz}")
-    print(f"  Project: {project_dir}")
-    print(f"  Output : {output_root}")
+    logger.info("  Models : %s", ", ".join(args.models))
+    logger.info("  Epochs : %s", args.epochs)
+    logger.info("  Train sz: %s", args.imgsz)
+    logger.info("  Project: %s", project_dir)
+    logger.info("  Output : %s", output_root)
 
     # Flip on cuDNN benchmark + TF32 before any CUDA work happens.
     enable_gpu_fast_path()
@@ -669,9 +695,9 @@ def main() -> None:
             )
         else:
             if not best_pt.exists():
-                print(f"  ✗ {best_pt} not found – cannot skip training")
+                logger.error("  ✗ %s not found – cannot skip training", best_pt)
                 continue
-            print(f"  ℹ  Re-using existing weights: {best_pt}")
+            logger.info("  ℹ  Re-using existing weights: %s", best_pt)
 
         # --- Export TFLite INT8 -------------------------------------------
         tflite_dir = output_root / "tflite"
@@ -699,24 +725,40 @@ def main() -> None:
 
     # --- Summary ----------------------------------------------------------
     log("PIPELINE COMPLETE")
-    print("Output directory structure:")
+    logger.info("Output directory structure:")
     for dirpath, dirnames, filenames in os.walk(output_root):
         depth = dirpath.replace(str(output_root), "").count(os.sep)
         indent = "  " * (depth + 1)
-        print(f"{indent}{os.path.basename(dirpath)}/")
+        logger.info("%s%s/", indent, os.path.basename(dirpath))
         sub_indent = "  " * (depth + 2)
         for f in sorted(filenames):
             fpath = Path(dirpath) / f
             size_kb = fpath.stat().st_size / 1024
-            print(f"{sub_indent}{f}  ({size_kb:.0f} KB)")
+            logger.info("%s%s  (%.0f KB)", sub_indent, f, size_kb)
 
-    print(
+    logger.info(
         "\n  Next steps:\n"
         "  1. Copy the model .tflite (or _vela.tflite for AE3) + labels.txt\n"
         "     to your OpenMV Cam's internal flash or SD card.\n"
         "  2. Upload the matching MicroPython script from openmv-scripts/.\n"
         "  3. Run from OpenMV IDE or on boot.\n"
     )
+
+
+def main() -> None:
+    args = parse_args()
+    _, log_path = setup_logging("train_and_export", log_dir=args.log_dir)
+    pipeline_t0 = time.perf_counter()
+    try:
+        _run_pipeline(args)
+    except Exception:
+        logger.exception("✗ Pipeline aborted by an unhandled exception")
+        raise
+    finally:
+        logger.info("Total pipeline wall time: %.1fs",
+                    time.perf_counter() - pipeline_t0)
+        logger.info("Full log written to %s", log_path)
+        shutdown_logging()
 
 
 if __name__ == "__main__":

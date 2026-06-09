@@ -408,6 +408,35 @@ export/
     └── ...
 ```
 
+### Run logs
+
+Every invocation of `train_and_export.py` (and `tune_hyperparameters.py`)
+writes a timestamped log file under `logs/`, e.g.
+`logs/train_and_export_20260609-131945.log`. The log captures
+**everything** the run prints — our own progress messages (timestamped),
+Ultralytics' training/export output, and the stdout/stderr of every
+child process the pipeline spawns: the GPU-free TFLite export, Arm Vela,
+and STEdgeAI. Subprocess output is interleaved into the file **in the
+order it actually happened**, tagged with its source (`[export:…]`,
+`[vela]`, `[stedgeai]`), so a single file is a faithful, sequential
+transcript of the whole run. The console still shows the same output
+live.
+
+```bash
+# Default: logs/ in the working directory
+uv run python train_and_export.py
+
+# Send logs somewhere else (e.g. a mounted volume)
+uv run python train_and_export.py --log-dir /mnt/runs/logs
+
+# Tail the most recent log while a run is in progress
+tail -f "$(ls -t logs/*.log | head -1)"
+```
+
+`logs/` is gitignored. Under Docker the project is bind-mounted at
+`/workspace`, so logs written by the `train` / `tune` / `export`
+services land in `logs/` on the host automatically.
+
 ---
 
 ## 2b. Hyperparameter Tuning (Ray Tune + Optuna + TensorBoard)
