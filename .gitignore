@@ -15,6 +15,10 @@ export/
 *.tflite
 *.onnx
 
+# Run logs (train_and_export.py / tune_hyperparameters.py)
+logs/
+*.log
+
 # IDE
 .vscode/
 .idea/
