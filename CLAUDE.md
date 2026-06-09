@@ -283,6 +283,27 @@ declines them.
    TensorFlow, downgrading the GPU, or moving the export back in-process —
    the export never needed the GPU.
 
+7. **`model.export(int8=True)` returns a *dynamic-range* model, not a
+   full-integer one — Vela rejects it.** Ultralytics builds its
+   `*_int8.tflite` by **renaming onnx2tf's `*_dynamic_range_quant.tflite`**
+   (see `ultralytics/utils/export/tensorflow.py`): INT8 *weights* but
+   **FLOAT32 feature maps and FLOAT32 I/O** (Ultralytics' own code comments
+   it `# fp32 in/out`). Hand that to Arm Vela and every operator fails the
+   supported-operator check with `Reason: Operation has tensor with
+   unsupported DataType Float32` → `CPU operators = 100%`, `NPU operators =
+   0`, `0 MACs`. The file size is a trap: it's ~INT8-weight-sized (e.g.
+   2.7 MB for YOLO11n), so it *looks* quantised. The genuinely deployable
+   models are onnx2tf's siblings in the same `*_saved_model/` dir:
+   `*_full_integer_quant.tflite` (INT8 weights **+ activations + int8 I/O**;
+   correct for Ethos-U55 / Neural-ART) and `*_integer_quant.tflite` (INT8
+   core, FP32 I/O). `export_tflite_int8` calls `_select_npu_tflite` to pick
+   `*_full_integer_quant.tflite` (then `*_integer_quant.tflite`) instead of
+   the returned `*_int8.tflite`. Do **not** "simplify" it back to copying
+   `model.export(...)`'s return value — that silently reintroduces the
+   all-CPU model. The OpenMV `ml`/`tf` runtime reads quant params from the
+   model, so INT8 I/O is transparent on-device (and is what the NPU path
+   wants); no `openmv-scripts/` change is needed.
+
 ## When in doubt
 
 - The README is the long-form user-facing documentation; **this file

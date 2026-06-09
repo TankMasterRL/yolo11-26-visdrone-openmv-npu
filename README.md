@@ -786,9 +786,17 @@ conversion runs on the CPU while training still uses the GPU. The
 conversion is CPU work and does not need the GPU; if you still hit this
 error, make sure you're on a build that includes the isolated-export fix.
 
-**Vela compilation fails:**
-Ensure the model is fully INT8 quantised (including inputs/outputs).
-Run `vela --supported-ops-report` to check operator compatibility.
+**Vela puts every op on the CPU (`NPU operators = 0`,
+`Reason: Operation has tensor with unsupported DataType Float32`):**
+The Ethos-U55 only runs integer feature maps, so Vela needs a *fully*
+INT8 model (weights **and** activations **and** I/O). Ultralytics'
+`model.export(int8=True)` returns a **dynamic-range** model — INT8
+weights but FLOAT32 activations/I/O — which trips this. The pipeline
+already works around it: `export_tflite_int8` selects onnx2tf's
+`*_full_integer_quant.tflite` sibling instead (see Gotcha 7 in
+`CLAUDE.md`). If you compile a TFLite by hand, point `vela` at the
+`*_full_integer_quant.tflite` file, not the `*_int8.tflite` one, and use
+`vela --supported-ops-report` to check operator compatibility.
 
 **stedgeai not found:**
 Install [STM32Cube.AI](https://www.st.com/en/embedded-software/x-cube-ai.html)

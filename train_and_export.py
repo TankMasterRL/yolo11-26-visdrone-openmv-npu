@@ -363,6 +363,46 @@ def train_model(
 # Step 2: TFLite INT8 Export
 # ---------------------------------------------------------------------------
 
+def _select_npu_tflite(returned: Path) -> tuple[Path, str]:
+    """Pick the genuinely-integer TFLite for NPU compilation.
+
+    ``model.export(format="tflite", int8=True)`` returns ``*_int8.tflite``,
+    which Ultralytics creates by **renaming onnx2tf's
+    ``*_dynamic_range_quant.tflite``** (see
+    ``ultralytics/utils/export/tensorflow.py``). That is a *weight-only*
+    ("hybrid") model: INT8 weights but **FLOAT32 feature maps and FLOAT32
+    input/output**. It is unusable on the Ethos-U55 — Arm Vela rejects every
+    operator with ``unsupported DataType Float32`` and the whole graph falls
+    back to the CPU (``NPU operators = 0``). onnx2tf also emits, in the same
+    ``*_saved_model`` directory, the integer models we can actually deploy:
+
+      * ``*_full_integer_quant.tflite`` — INT8 weights, activations *and*
+        int8 input/output. The correct artefact for the Ethos-U55 (Vela)
+        and ST Neural-ART (STEdgeAI) NPUs, and what the OpenMV firmware
+        expects to route to the accelerator.
+      * ``*_integer_quant.tflite`` — INT8 internals but FLOAT32 I/O. Vela
+        still accelerates the convolution core; only the leading QUANTIZE /
+        trailing DEQUANTIZE run on the CPU. Used only if the fully-integer
+        variant is missing.
+
+    Returns the chosen path plus a short human-readable label. Falls back to
+    the returned dynamic-range file (the previous, broken behaviour) only if
+    neither integer variant exists, so the pipeline never loses a file.
+    """
+    saved_model = returned.parent
+    for pattern, label in (
+        ("*_full_integer_quant.tflite", "full-integer (INT8 I/O)"),
+        ("*_integer_quant.tflite", "integer (INT8 core, FP32 I/O)"),
+    ):
+        # The first pattern is a suffix of the second, but we only reach the
+        # ``_integer_quant`` branch when no ``_full_integer_quant`` file
+        # exists, so the glob there can only match the plain integer model.
+        matches = sorted(saved_model.glob(pattern))
+        if matches:
+            return matches[0], label
+    return returned, "dynamic-range (FP32 — NOT NPU-deployable)"
+
+
 def export_tflite_int8(
     best_pt: Path,
     model_name: str,
@@ -392,10 +432,25 @@ def export_tflite_int8(
     # Ultralytics places the tflite alongside best.pt or in a _saved_model dir
     result_path = Path(result_path)
 
+    # ``model.export`` returns the *dynamic-range* model (INT8 weights but
+    # FLOAT32 feature maps/I/O) renamed to ``*_int8.tflite``. The Ethos-U55
+    # cannot run it — Vela flags every op as ``unsupported DataType Float32``
+    # and puts 0 ops on the NPU. Swap in the fully-integer sibling onnx2tf
+    # wrote to the same dir; see ``_select_npu_tflite`` for the ranking.
+    npu_path, variant = _select_npu_tflite(result_path)
+    if npu_path != result_path:
+        logger.info("  Selected %s model for NPU: %s", variant, npu_path.name)
+    else:
+        logger.warning(
+            "  ⚠  No fully-integer TFLite alongside %s — using the %s model. "
+            "Vela will reject every op as Float32 and run nothing on the "
+            "Ethos-U55 NPU.", result_path.name, variant,
+        )
+
     # Copy to our organised output directory
     output_dir.mkdir(parents=True, exist_ok=True)
     dst = output_dir / f"{model_name}_int8.tflite"
-    shutil.copy2(result_path, dst)
+    shutil.copy2(npu_path, dst)
     logger.info("  ✓ TFLite INT8: %s  (%.0f KB)", dst, dst.stat().st_size / 1024)
     return dst
 
