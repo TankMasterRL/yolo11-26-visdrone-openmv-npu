@@ -92,12 +92,19 @@ COPY --from=uv /uv /uvx /bin/
 # pure system packages (not pip-installable), so they live here rather
 # than in pyproject.toml. Installed before the uv pip layer so this
 # rarely-changing layer stays cached across pyproject.toml edits.
+#
+# apt's package archives and downloaded lists are written to BuildKit
+# cache mounts (type=cache), so they never enter the image layer — this
+# keeps the layer slim without an explicit `rm -rf /var/lib/apt/lists/*`
+# cleanup, and reuses the cache to speed up rebuilds. `sharing=locked`
+# serialises concurrent builds that touch the same cache.
 # ---------------------------------------------------------------------------
-RUN apt-get update \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update \
     && apt-get install -y --no-install-recommends \
         gcc \
-        make \
-    && rm -rf /var/lib/apt/lists/*
+        make
 
 # ---------------------------------------------------------------------------
 # Install project extras via uv using pyproject.toml as the single
