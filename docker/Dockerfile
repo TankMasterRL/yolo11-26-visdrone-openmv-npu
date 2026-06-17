@@ -85,6 +85,29 @@ LABEL org.opencontainers.image.description="YOLO11/YOLO26 × VisDrone × OpenMV 
 COPY --from=uv /uv /uvx /bin/
 
 # ---------------------------------------------------------------------------
+# System build toolchain for STEdgeAI-Core (N6 Neural-ART compiler).
+#
+# STEdgeAI-Core generates C/C++ code and invokes a host toolchain to build
+# the network library, so it needs `gcc`, `g++`, and `make` on PATH. These are
+# pure system packages (not pip-installable), so they live here rather
+# than in pyproject.toml. Installed before the uv pip layer so this
+# rarely-changing layer stays cached across pyproject.toml edits.
+#
+# apt's package archives and downloaded lists are written to BuildKit
+# cache mounts (type=cache), so they never enter the image layer — this
+# keeps the layer slim without an explicit `rm -rf /var/lib/apt/lists/*`
+# cleanup, and reuses the cache to speed up rebuilds. `sharing=locked`
+# serialises concurrent builds that touch the same cache.
+# ---------------------------------------------------------------------------
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update \
+    && apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+        make
+
+# ---------------------------------------------------------------------------
 # Install project extras via uv using pyproject.toml as the single
 # source of truth. We install --system rather than letting uv create a
 # .venv so the Ultralytics base image's pre-installed, GPU-linked
