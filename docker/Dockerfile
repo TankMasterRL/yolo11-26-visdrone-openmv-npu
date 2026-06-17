@@ -87,8 +87,8 @@ COPY --from=uv /uv /uvx /bin/
 # ---------------------------------------------------------------------------
 # System build toolchain for STEdgeAI-Core (N6 Neural-ART compiler).
 #
-# STEdgeAI-Core generates C code and invokes a host C toolchain to build
-# the network library, so it needs `gcc` and `make` on PATH. These are
+# STEdgeAI-Core generates C/C++ code and invokes a host toolchain to build
+# the network library, so it needs `gcc`, `g++`, and `make` on PATH. These are
 # pure system packages (not pip-installable), so they live here rather
 # than in pyproject.toml. Installed before the uv pip layer so this
 # rarely-changing layer stays cached across pyproject.toml edits.
@@ -104,6 +104,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update \
     && apt-get install -y --no-install-recommends \
         gcc \
+        g++ \
         make
 
 # ---------------------------------------------------------------------------
