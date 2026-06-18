@@ -258,6 +258,24 @@ def setup_child_logging(
     return logger
 
 
+# Some child tools we drive open with an interactive prompt and then block
+# on stdin, which would hang an otherwise unattended pipeline. The clearest
+# example is ST's ``stedgeai`` (STEdgeAI Core, the N6 compiler), whose first
+# line is a telemetry-consent question:
+#
+#     Do you allow statistics to improve the command line? (y)es / (n)o
+#
+# ``stream_subprocess`` watches the child's stdout for it and answers "n"
+# (decline) on the child's behalf. Crucially the tool prints the prompt
+# *without* a trailing newline — it waits for the answer on the same line —
+# so it must be matched against the partial, not-yet-terminated output
+# rather than a completed line (matching only on the trailing punctuation
+# would be brittle, so we key off the stable lead-in text).
+_STATS_CONSENT_RE = re.compile(
+    rb"Do you allow statistics to improve the command line"
+)
+
+
 def stream_subprocess(
     cmd: list[str],
     *,
@@ -275,22 +293,69 @@ def stream_subprocess(
     attributable in the unified log. Because the relay runs in the
     parent's calling thread, child output is sequentially integrated with
     the parent's own log lines.
+
+    The relay also watches for the ``stedgeai`` telemetry-consent prompt
+    (see ``_STATS_CONSENT_RE``) and answers "n" on the child's stdin so the
+    pipeline never blocks waiting for an interactive response. Output is
+    read in raw chunks rather than via line iteration precisely so the
+    prompt — which carries no trailing newline — can be matched before the
+    child blocks on input.
     """
     logger.info("[%s] $ %s", tag, " ".join(str(c) for c in cmd))
     proc = subprocess.Popen(
         cmd,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=env,
         cwd=cwd,
-        bufsize=1,
-        text=True,
-        errors="replace",
     )
     assert proc.stdout is not None
-    with proc.stdout:
-        for line in proc.stdout:
-            logger.info("[%s] %s", tag, line.rstrip("\n"))
+
+    def _decline_statistics() -> None:
+        """Answer the telemetry prompt with "n" on the child's stdin."""
+        logger.info("[%s] auto-declining statistics prompt (answering 'n')", tag)
+        try:
+            if proc.stdin is not None:
+                proc.stdin.write(b"n\n")
+                proc.stdin.flush()
+        except OSError:
+            # Child may have already exited / closed its stdin — nothing
+            # left to answer.
+            pass
+
+    answered = False
+    buf = b""
+    out_fd = proc.stdout.fileno()
+    try:
+        while True:
+            try:
+                chunk = os.read(out_fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            # Match on the whole pending buffer so the prompt is caught
+            # whether or not a newline has arrived — it never does until the
+            # child receives its answer.
+            if not answered and _STATS_CONSENT_RE.search(buf):
+                _decline_statistics()
+                answered = True
+            # Normalise CR redraws to newlines (mirrors the file tee) and
+            # emit each completed line, keeping the trailing partial line —
+            # e.g. an as-yet-unanswered prompt — buffered for next time.
+            buf = buf.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                logger.info("[%s] %s", tag, line.decode("utf-8", "replace"))
+        # Flush any final line the child left without a trailing newline.
+        if buf:
+            logger.info("[%s] %s", tag, buf.decode("utf-8", "replace"))
+    finally:
+        proc.stdout.close()
+        if proc.stdin is not None:
+            proc.stdin.close()
     rc = proc.wait()
     emit = logger.info if rc == 0 else logger.error
     emit("[%s] process exited with code %d", tag, rc)
